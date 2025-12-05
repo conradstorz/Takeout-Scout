@@ -19,15 +19,38 @@ A lightweight, GUI-based tool for scanning and analyzing Google Takeout archives
 
 ## Installation
 
+### Using uv (Recommended)
+
 1. Clone this repository:
 ```bash
-git clone https://github.com/YOUR_USERNAME/Takeout_Scout.git
-cd Takeout_Scout
+git clone https://github.com/conradstorz/Takeout-Scout.git
+cd Takeout-Scout
 ```
 
-2. (Optional) Install loguru for better logging:
+2. Install with uv:
 ```bash
-pip install loguru
+# Install with enhanced logging
+uv pip install -e ".[logging]"
+
+# Or install minimal version (standard library only)
+uv pip install -e .
+```
+
+### Using pip
+
+1. Clone this repository:
+```bash
+git clone https://github.com/conradstorz/Takeout-Scout.git
+cd Takeout-Scout
+```
+
+2. Install dependencies:
+```bash
+# With enhanced logging
+pip install -e ".[logging]"
+
+# Or minimal install
+pip install -e .
 ```
 
 ## Usage
