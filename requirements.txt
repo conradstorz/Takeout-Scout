@@ -1,0 +1,5 @@
+# Optional dependencies
+# The application works with Python standard library only
+# Install these for enhanced features:
+
+loguru>=0.7.0  # Enhanced logging with rotation (optional but recommended)
