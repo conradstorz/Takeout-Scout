@@ -25,9 +25,45 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from enum import Enum
 
 import streamlit as st
 import pandas as pd
+
+
+# --- File status enum --------------------------------------------------------
+class FileStatus(Enum):
+    PENDING = "pending"
+    VALID = "valid"
+    INVALID = "invalid"
+    SCANNING = "scanning"
+    SCANNED = "scanned"
+    ERROR = "error"
+
+
+# --- File info dataclass -----------------------------------------------------
+@dataclass
+class FileInfo:
+    """Quick metadata about a file without deep scanning."""
+    path: Path
+    name: str
+    size: int
+    status: FileStatus
+    is_valid: bool
+    error_message: Optional[str] = None
+    file_type: Optional[str] = None  # 'zip', 'tgz', 'directory'
+    
+    def to_dict(self) -> dict:
+        return {
+            'path': str(self.path),
+            'name': self.name,
+            'size': self.size,
+            'size_human': human_size(self.size),
+            'status': self.status.value,
+            'is_valid': self.is_valid,
+            'error_message': self.error_message,
+            'file_type': self.file_type,
+        }
 
 # --- Logging setup -----------------------------------------------------------
 try:
@@ -196,6 +232,116 @@ def derive_parts_group(archive_path: Path) -> str:
     return archive_path.stem
 
 
+# --- Quick validation functions ----------------------------------------------
+def validate_and_get_info(path: Path) -> FileInfo:
+    """Quickly validate a file and get basic metadata without deep scanning."""
+    try:
+        if not path.exists():
+            return FileInfo(
+                path=path,
+                name=path.name,
+                size=0,
+                status=FileStatus.INVALID,
+                is_valid=False,
+                error_message="File not found",
+                file_type=None
+            )
+        
+        size = path.stat().st_size
+        
+        # Determine file type
+        if path.is_dir():
+            return FileInfo(
+                path=path,
+                name=path.name,
+                size=size,
+                status=FileStatus.VALID,
+                is_valid=True,
+                file_type='directory'
+            )
+        
+        # Check if it's a zip file
+        if path.suffix.lower() == '.zip':
+            is_valid = validate_zip(path)
+            return FileInfo(
+                path=path,
+                name=path.name,
+                size=size,
+                status=FileStatus.VALID if is_valid else FileStatus.INVALID,
+                is_valid=is_valid,
+                error_message=None if is_valid else "Corrupt or invalid ZIP file",
+                file_type='zip'
+            )
+        
+        # Check if it's a tar/tgz file
+        elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
+            is_valid = validate_tar(path)
+            return FileInfo(
+                path=path,
+                name=path.name,
+                size=size,
+                status=FileStatus.VALID if is_valid else FileStatus.INVALID,
+                is_valid=is_valid,
+                error_message=None if is_valid else "Corrupt or invalid TAR/TGZ file",
+                file_type='tgz'
+            )
+        
+        # Unsupported file type
+        return FileInfo(
+            path=path,
+            name=path.name,
+            size=size,
+            status=FileStatus.INVALID,
+            is_valid=False,
+            error_message="Unsupported file type (only ZIP, TGZ supported)",
+            file_type='unknown'
+        )
+        
+    except Exception as e:
+        logger.exception(f"Error validating {path}: {e}")
+        return FileInfo(
+            path=path,
+            name=path.name if path else "Unknown",
+            size=0,
+            status=FileStatus.ERROR,
+            is_valid=False,
+            error_message=str(e),
+            file_type=None
+        )
+
+
+def validate_zip(path: Path) -> bool:
+    """Validate a ZIP file without extracting it."""
+    try:
+        with zipfile.ZipFile(path, 'r') as zf:
+            # Just verify we can open the ZIP - don't read the full file list
+            # for large archives as it can be slow. Just check the first entry.
+            infolist = zf.infolist()
+            if not infolist:
+                return False  # Empty ZIP
+            # Successfully opened and has at least one file
+            return True
+    except zipfile.BadZipFile:
+        return False
+    except Exception as e:
+        logger.warning(f"ZIP validation error for {path}: {e}")
+        return False
+
+
+def validate_tar(path: Path) -> bool:
+    """Validate a TAR/TGZ file without extracting it."""
+    try:
+        with tarfile.open(path, 'r:*') as tf:
+            # Try to read the member list
+            _ = tf.getmembers()
+            return True
+    except tarfile.TarError:
+        return False
+    except Exception as e:
+        logger.warning(f"TAR validation error for {path}: {e}")
+        return False
+
+
 def scan_archive(path: Path) -> ArchiveSummary:
     try:
         size = path.stat().st_size
@@ -347,6 +493,8 @@ def main():
         st.session_state.results = []
     if 'scanned_paths' not in st.session_state:
         st.session_state.scanned_paths = set()
+    if 'pending_files' not in st.session_state:
+        st.session_state.pending_files = []  # List of FileInfo objects
     
     # Sidebar for selection
     with st.sidebar:
@@ -365,8 +513,9 @@ def main():
                 help="Paste the full path to a folder containing Takeout archives or data"
             )
             
-            if folder_path and st.button("📁 Scan Folder", type="primary"):
-                process_folder(Path(folder_path))
+            if folder_path and st.button("📁 Load Folder", type="primary"):
+                cleaned_path = clean_file_path(folder_path)
+                load_folder(Path(cleaned_path))
         
         else:  # Files mode
             st.info("💡 Enter file paths (one per line) or paste from file explorer")
@@ -377,78 +526,340 @@ def main():
                 help="Paste full paths to ZIP or TGZ files, one per line"
             )
             
-            if file_paths_text and st.button("📄 Scan Files", type="primary"):
-                file_paths = [line.strip() for line in file_paths_text.split('\n') if line.strip()]
-                process_files([Path(p) for p in file_paths])
+            if file_paths_text and st.button("📄 Load Files", type="primary"):
+                raw_paths = [line.strip() for line in file_paths_text.split('\n') if line.strip()]
+                cleaned_paths = [clean_file_path(p) for p in raw_paths]
+                load_files([Path(p) for p in cleaned_paths])
         
         st.divider()
+        
+        # Bulk actions
+        if st.session_state.pending_files:
+            st.subheader("Bulk Actions")
+            if st.button("🔍 Scan All Pending", type="primary", width="stretch"):
+                scan_all_pending()
         
         if st.session_state.results:
             st.success(f"✅ {len(st.session_state.results)} items scanned")
             
-            if st.button("🔄 Clear Results"):
+            if st.button("🔄 Clear All", width="stretch"):
                 st.session_state.results = []
                 st.session_state.scanned_paths = set()
+                st.session_state.pending_files = []
                 st.rerun()
             
-            if st.button("💾 Export CSV"):
+            if st.button("💾 Export CSV", width="stretch"):
                 export_csv()
     
-    # Main area - Results table
-    if st.session_state.results:
-        st.subheader("Scan Results")
+    # Main area - Show pending files and results
+    if st.session_state.pending_files or st.session_state.results:
         
-        df = pd.DataFrame([r.to_dict() for r in st.session_state.results])
+        # Pending files section
+        if st.session_state.pending_files:
+            st.subheader("📋 Files Ready to Scan")
+            display_file_cards()
+            st.divider()
         
-        # Display interactive table
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Path": st.column_config.TextColumn("Path", width="large"),
-                "Service": st.column_config.TextColumn("Service", width="medium"),
-                "Size": st.column_config.TextColumn("Size", width="small"),
-            }
-        )
-        
-        # Summary stats
-        col1, col2, col3, col4, col5 = st.columns(5)
-        total_files = sum(r.file_count for r in st.session_state.results)
-        total_photos = sum(r.photos for r in st.session_state.results)
-        total_videos = sum(r.videos for r in st.session_state.results)
-        total_json = sum(r.json_sidecars for r in st.session_state.results)
-        total_size = sum(r.compressed_size for r in st.session_state.results)
-        
-        col1.metric("Total Files", f"{total_files:,}")
-        col2.metric("Photos", f"{total_photos:,}")
-        col3.metric("Videos", f"{total_videos:,}")
-        col4.metric("JSON", f"{total_json:,}")
-        col5.metric("Total Size", human_size(total_size))
-        
+        # Scanned results section
+        if st.session_state.results:
+            st.subheader("✅ Scan Results")
+            display_results_table()
+    
     else:
-        st.info("👈 Select a folder or files from the sidebar to begin scanning")
+        show_welcome_screen()
+
+
+# --- UI Display Functions ----------------------------------------------------
+def display_file_cards():
+    """Display beautiful cards for each pending file."""
+    for idx, file_info in enumerate(st.session_state.pending_files):
+        with st.container():
+            # Create a nice border using columns
+            col1, col2, col3 = st.columns([3, 2, 1])
+            
+            with col1:
+                # File name and type
+                icon = get_file_icon(file_info)
+                st.markdown(f"### {icon} {file_info.name}")
+                st.caption(f"`{file_info.path.parent}`")
+            
+            with col2:
+                # Status and size info
+                status_color = get_status_color(file_info.status)
+                status_text = get_status_text(file_info)
+                st.markdown(f"**Status:** :{status_color}[{status_text}]")
+                st.markdown(f"**Size:** {human_size(file_info.size)}")
+                st.markdown(f"**Type:** {file_info.file_type or 'Unknown'}")
+            
+            with col3:
+                # Scan button
+                if file_info.is_valid and file_info.status != FileStatus.SCANNED:
+                    if st.button(f"🔍 Scan", key=f"scan_{idx}", type="primary"):
+                        scan_single_file(idx)
+                elif not file_info.is_valid:
+                    st.error("❌ Invalid")
+                else:
+                    st.success("✅ Done")
+            
+            # Error message if any
+            if file_info.error_message:
+                st.error(f"⚠️ {file_info.error_message}")
+            
+            st.divider()
+
+
+def display_results_table():
+    """Display the scanned results in a table."""
+    df = pd.DataFrame([r.to_dict() for r in st.session_state.results])
+    
+    # Display interactive table
+    st.dataframe(
+        df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Path": st.column_config.TextColumn("Path", width="large"),
+            "Service": st.column_config.TextColumn("Service", width="medium"),
+            "Size": st.column_config.TextColumn("Size", width="small"),
+        }
+    )
+    
+    # Summary stats
+    col1, col2, col3, col4, col5 = st.columns(5)
+    total_files = sum(r.file_count for r in st.session_state.results)
+    total_photos = sum(r.photos for r in st.session_state.results)
+    total_videos = sum(r.videos for r in st.session_state.results)
+    total_json = sum(r.json_sidecars for r in st.session_state.results)
+    total_size = sum(r.compressed_size for r in st.session_state.results)
+    
+    col1.metric("Total Files", f"{total_files:,}")
+    col2.metric("Photos", f"{total_photos:,}")
+    col3.metric("Videos", f"{total_videos:,}")
+    col4.metric("JSON", f"{total_json:,}")
+    col5.metric("Total Size", human_size(total_size))
+
+
+def show_welcome_screen():
+    """Show welcome screen when no files are loaded."""
+    st.info("👈 Select a folder or files from the sidebar to begin")
+    
+    with st.expander("ℹ️ How to use"):
+        st.markdown("""
+        **Folder Mode:**
+        1. Copy a folder path from File Explorer
+        2. Paste it in the 'Folder Path' box
+        3. Click 'Load Folder' to validate files
+        4. Click individual 'Scan' buttons or 'Scan All Pending'
         
-        with st.expander("ℹ️ How to use"):
-            st.markdown("""
-            **Folder Mode:**
-            1. Copy a folder path from File Explorer
-            2. Paste it in the 'Folder Path' box
-            3. Click 'Scan Folder'
+        **Files Mode:**
+        1. Select files in File Explorer
+        2. Shift+Right-Click and choose 'Copy as path'
+        3. Paste into the 'File Paths' box
+        4. Click 'Load Files' to validate
+        5. Click individual 'Scan' buttons or 'Scan All Pending'
+        
+        **Features:**
+        - Instant file validation
+        - Non-destructive scanning (files are never modified)
+        - Detects Google Photos, Drive, Maps, and more
+        - Supports ZIP and TGZ archives
+        - Scans uncompressed Takeout folders
+        - Export results to CSV
+        """)
+
+
+def get_file_icon(file_info: FileInfo) -> str:
+    """Get an appropriate icon for the file type."""
+    if file_info.file_type == 'zip':
+        return '📦'
+    elif file_info.file_type == 'tgz':
+        return '📚'
+    elif file_info.file_type == 'directory':
+        return '📁'
+    else:
+        return '📄'
+
+
+def get_status_color(status: FileStatus) -> str:
+    """Get color for status badge."""
+    if status == FileStatus.VALID:
+        return 'green'
+    elif status == FileStatus.INVALID:
+        return 'red'
+    elif status == FileStatus.SCANNING:
+        return 'orange'
+    elif status == FileStatus.SCANNED:
+        return 'blue'
+    elif status == FileStatus.ERROR:
+        return 'red'
+    else:
+        return 'gray'
+
+
+def get_status_text(file_info: FileInfo) -> str:
+    """Get human-readable status text."""
+    if file_info.status == FileStatus.VALID:
+        return "Valid & Ready"
+    elif file_info.status == FileStatus.INVALID:
+        return "Invalid File"
+    elif file_info.status == FileStatus.SCANNING:
+        return "Scanning..."
+    elif file_info.status == FileStatus.SCANNED:
+        return "Scanned"
+    elif file_info.status == FileStatus.ERROR:
+        return "Error"
+    else:
+        return "Pending"
+
+
+# --- File Loading Functions --------------------------------------------------
+def clean_file_path(path_str: str) -> str:
+    """Clean up a file path string from various sources."""
+    # Remove quotes that Windows adds when you copy as path
+    path_str = path_str.strip()
+    if path_str.startswith('"') and path_str.endswith('"'):
+        path_str = path_str[1:-1]
+    # Also handle single quotes
+    if path_str.startswith("'") and path_str.endswith("'"):
+        path_str = path_str[1:-1]
+    return path_str.strip()
+
+
+def load_folder(folder_path: Path):
+    """Load and validate files from a folder."""
+    if not folder_path.exists():
+        st.error(f"❌ Folder not found: `{folder_path}`")
+        st.caption(f"Resolved path: `{folder_path.resolve()}`")
+        return
+    
+    with st.spinner(f"Loading files from {folder_path.name}..."):
+        archives, directories = find_archives_and_dirs(folder_path)
+        all_items = list(archives) + list(directories)
+        
+        if not all_items:
+            st.warning(f"⚠️ No archives or Takeout directories found in {folder_path}")
+            # Still validate the folder itself
+            file_info = validate_and_get_info(folder_path)
+            st.session_state.pending_files.append(file_info)
+            st.rerun()
+            return
+        
+        # Validate all found files
+        progress_bar = st.progress(0, text=f"Validating 0/{len(all_items)} files...")
+        for i, item in enumerate(all_items, 1):
+            file_info = validate_and_get_info(item)
+            st.session_state.pending_files.append(file_info)
+            progress_bar.progress(i / len(all_items), text=f"Validating {i}/{len(all_items)} files...")
+        
+        progress_bar.empty()
+        st.success(f"✅ Loaded {len(all_items)} files")
+        st.rerun()
+
+
+def load_files(file_paths: List[Path]):
+    """Load and validate individual files."""
+    if not file_paths:
+        st.warning("⚠️ No file paths provided")
+        return
+    
+    valid_count = 0
+    
+    with st.spinner(f"Validating {len(file_paths)} file(s)..."):
+        progress_bar = st.progress(0, text=f"Validating 0/{len(file_paths)} files...")
+        
+        for i, file_path in enumerate(file_paths, 1):
+            # Debug: show what path we're trying to validate
+            logger.info(f"Validating path: {file_path} (exists: {file_path.exists()})")
             
-            **Files Mode:**
-            1. Select files in File Explorer
-            2. Shift+Right-Click and choose 'Copy as path'
-            3. Paste into the 'File Paths' box
-            4. Click 'Scan Files'
+            file_info = validate_and_get_info(file_path)
+            st.session_state.pending_files.append(file_info)
+            if file_info.is_valid:
+                valid_count += 1
+            progress_bar.progress(i / len(file_paths), text=f"Validating {i}/{len(file_paths)} files...")
+        
+        progress_bar.empty()
+        
+        if valid_count == 0:
+            st.error(f"❌ No valid files found")
+            # Show the first error for debugging
+            if st.session_state.pending_files:
+                first = st.session_state.pending_files[-len(file_paths)]
+                if first.error_message:
+                    st.caption(f"First error: {first.error_message}")
+                st.caption(f"Path tried: `{first.path}`")
+        elif valid_count < len(file_paths):
+            st.warning(f"⚠️ Loaded {valid_count}/{len(file_paths)} valid files")
+        else:
+            st.success(f"✅ All {valid_count} files are valid")
+        
+        st.rerun()
+
+
+def scan_single_file(index: int):
+    """Scan a single file from the pending list."""
+    file_info = st.session_state.pending_files[index]
+    
+    with st.spinner(f"Scanning {file_info.name}..."):
+        try:
+            if file_info.file_type == 'directory':
+                summary = scan_directory(file_info.path)
+            else:
+                summary = scan_archive(file_info.path)
             
-            **Features:**
-            - Non-destructive scanning (files are never modified)
-            - Detects Google Photos, Drive, Maps, and more
-            - Supports ZIP and TGZ archives
-            - Scans uncompressed Takeout folders
-            - Export results to CSV
-            """)
+            st.session_state.results.append(summary)
+            st.session_state.scanned_paths.add(str(file_info.path))
+            
+            # Update status
+            file_info.status = FileStatus.SCANNED
+            st.session_state.pending_files[index] = file_info
+            
+            st.success(f"✅ Scanned {file_info.name}")
+            st.rerun()
+            
+        except Exception as e:
+            logger.exception(f"Failed to scan {file_info.path}: {e}")
+            file_info.status = FileStatus.ERROR
+            file_info.error_message = str(e)
+            st.session_state.pending_files[index] = file_info
+            st.error(f"❌ Error scanning {file_info.name}: {e}")
+
+
+def scan_all_pending():
+    """Scan all pending valid files."""
+    valid_files = [
+        (i, f) for i, f in enumerate(st.session_state.pending_files)
+        if f.is_valid and f.status != FileStatus.SCANNED
+    ]
+    
+    if not valid_files:
+        st.warning("No files to scan")
+        return
+    
+    progress_bar = st.progress(0, text=f"Scanning 0/{len(valid_files)} files...")
+    
+    for count, (index, file_info) in enumerate(valid_files, 1):
+        try:
+            if file_info.file_type == 'directory':
+                summary = scan_directory(file_info.path)
+            else:
+                summary = scan_archive(file_info.path)
+            
+            st.session_state.results.append(summary)
+            st.session_state.scanned_paths.add(str(file_info.path))
+            file_info.status = FileStatus.SCANNED
+            st.session_state.pending_files[index] = file_info
+            
+        except Exception as e:
+            logger.exception(f"Failed to scan {file_info.path}: {e}")
+            file_info.status = FileStatus.ERROR
+            file_info.error_message = str(e)
+            st.session_state.pending_files[index] = file_info
+        
+        progress_bar.progress(count / len(valid_files), text=f"Scanning {count}/{len(valid_files)} files...")
+    
+    progress_bar.empty()
+    st.success(f"✅ Scanned {len(valid_files)} files")
+    st.rerun()
 
 
 def process_folder(folder_path: Path):
