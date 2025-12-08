@@ -386,6 +386,7 @@ class TakeoutScoutGUI(tk.Tk):
         self.geometry('1000x600')
         self.minsize(800, 500)
         self._root_dir: Optional[Path] = None
+        self._selected_files: Optional[List[Path]] = None
         self._rows: List[ArchiveSummary] = []
         self._prev_index: Dict[str, Dict[str, float]] = load_index()
         self._new_paths: set[str] = set()
@@ -405,8 +406,11 @@ class TakeoutScoutGUI(tk.Tk):
         btn_frame = ttk.Frame(top)
         btn_frame.pack(side=tk.TOP, fill=tk.X)
         
-        btn_choose = ttk.Button(btn_frame, text='Choose Folder…', command=self.on_choose)
+        btn_choose = ttk.Button(btn_frame, text='Choose Folder…', command=self.on_choose_folder)
         btn_choose.pack(side=tk.LEFT)
+
+        btn_choose_files = ttk.Button(btn_frame, text='Choose Files…', command=self.on_choose_files)
+        btn_choose_files.pack(side=tk.LEFT, padx=(5, 0))
 
         self.btn_scan = ttk.Button(btn_frame, text='Scan All', command=self.on_scan, state=tk.DISABLED)
         self.btn_scan.pack(side=tk.LEFT, padx=(10, 0))
@@ -478,18 +482,47 @@ class TakeoutScoutGUI(tk.Tk):
         status.pack(side=tk.BOTTOM, fill=tk.X)
 
     # Handlers
-    def on_choose(self) -> None:
+    def on_choose_folder(self) -> None:
+        """Let user select a folder."""
         chosen = filedialog.askdirectory(title='Select folder with Google Takeout archives or data')
-        if chosen:
-            self._root_dir = Path(chosen)
-            self.dir_var.set(str(self._root_dir))
-            self.btn_scan.config(state=tk.NORMAL)
-            
-            # Immediately show the selected folder in the table
-            self._show_selected_folder()
-            
-            self.status('Folder selected. Click "Scan" to analyze contents.')
-            logger.info(f"Chosen folder: {self._root_dir}")
+        if not chosen:
+            return
+        
+        # User selected a folder
+        self._root_dir = Path(chosen)
+        self._selected_files = None
+        self.dir_var.set(str(self._root_dir))
+        self.btn_scan.config(state=tk.NORMAL)
+        
+        # Immediately show the selected folder in the table
+        self._show_selected_folder()
+        
+        self.status('Folder selected. Click "Scan" to analyze contents.')
+        logger.info(f"Chosen folder: {self._root_dir}")
+
+    def on_choose_files(self) -> None:
+        """Let user select individual archive files."""
+        files = filedialog.askopenfilenames(
+            title='Select Google Takeout archive files',
+            filetypes=[
+                ('Archive files', '*.zip *.tgz *.tar.gz'),
+                ('ZIP files', '*.zip'),
+                ('TGZ files', '*.tgz *.tar.gz'),
+                ('All files', '*.*')
+            ]
+        )
+        if not files:
+            return
+        
+        # If they selected files, use the parent directory as root
+        # and we'll scan those specific files
+        self._root_dir = Path(files[0]).parent
+        self._selected_files = [Path(f) for f in files]
+        self.dir_var.set(f"{len(files)} file(s) selected: {self._root_dir}")
+        self.btn_scan.config(state=tk.NORMAL)
+        self._show_selected_files()
+        self.status(f'{len(files)} file(s) selected. Click "Scan All" or individual [Scan] buttons.')
+        logger.info(f"Chosen files: {files}")
 
     def _show_selected_folder(self) -> None:
         """Display the selected folder immediately in the table."""
@@ -513,6 +546,30 @@ class TakeoutScoutGUI(tk.Tk):
             '—',
             '—',
         ), tags=('scannable',))
+
+    def _show_selected_files(self) -> None:
+        """Display the selected files immediately in the table."""
+        if not self._selected_files:
+            return
+        
+        # Clear existing rows
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Show each selected file as pending scan
+        for file_path in self._selected_files:
+            self.tree.insert('', tk.END, values=(
+                '[Scan]',
+                str(file_path.name),
+                '(pending scan)',
+                '(pending scan)',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+            ), tags=('scannable',))
 
     def _on_tree_click(self, event) -> None:
         """Handle clicks on the tree, specifically on the Action column."""
@@ -540,11 +597,19 @@ class TakeoutScoutGUI(tk.Tk):
         
         # Find the actual path
         target_path = None
-        if self._root_dir and self._root_dir.name == source_name:
-            target_path = self._root_dir
-        else:
-            # Try to find it in our current directory
-            if self._root_dir:
+        
+        # Check if we have selected files
+        if self._selected_files:
+            for file_path in self._selected_files:
+                if file_path.name == source_name:
+                    target_path = file_path
+                    break
+        
+        # Otherwise check root directory
+        if not target_path:
+            if self._root_dir and self._root_dir.name == source_name:
+                target_path = self._root_dir
+            elif self._root_dir:
                 potential = self._root_dir / source_name
                 if potential.exists():
                     target_path = potential
@@ -633,9 +698,17 @@ class TakeoutScoutGUI(tk.Tk):
     def _scan_thread(self) -> None:
         start = time.time()
         try:
-            archives, directories = find_archives_and_dirs(self._root_dir or Path('.'))
-            total = len(archives) + len(directories)
-            logger.info(f"Found {len(archives)} archive(s) and {len(directories)} directory(ies).")
+            # If specific files were selected, scan only those
+            if self._selected_files:
+                archives = [f for f in self._selected_files if f.is_file()]
+                directories = [f for f in self._selected_files if f.is_dir()]
+                total = len(archives) + len(directories)
+                logger.info(f"Scanning {len(archives)} selected archive(s) and {len(directories)} selected directory(ies).")
+            else:
+                # Otherwise scan everything in the root directory
+                archives, directories = find_archives_and_dirs(self._root_dir or Path('.'))
+                total = len(archives) + len(directories)
+                logger.info(f"Found {len(archives)} archive(s) and {len(directories)} directory(ies).")
             
             if total == 0:
                 # No Takeout content found - show the folder with appropriate label
