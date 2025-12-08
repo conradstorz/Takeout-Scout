@@ -480,8 +480,34 @@ class TakeoutScoutGUI(tk.Tk):
             self._root_dir = Path(chosen)
             self.dir_var.set(str(self._root_dir))
             self.btn_scan.config(state=tk.NORMAL)
-            self.status('Folder selected. Click “Scan”.')
+            
+            # Immediately show the selected folder in the table
+            self._show_selected_folder()
+            
+            self.status('Folder selected. Click "Scan" to analyze contents.')
             logger.info(f"Chosen folder: {self._root_dir}")
+
+    def _show_selected_folder(self) -> None:
+        """Display the selected folder immediately in the table."""
+        if not self._root_dir:
+            return
+        
+        # Clear existing rows
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Show the selected folder as pending scan
+        self.tree.insert('', tk.END, values=(
+            str(self._root_dir.name),
+            '(pending scan)',
+            '(pending scan)',
+            '—',
+            '—',
+            '—',
+            '—',
+            '—',
+            '—',
+        ))
 
     def on_scan(self) -> None:
         if not self._root_dir:
@@ -504,7 +530,9 @@ class TakeoutScoutGUI(tk.Tk):
             logger.info(f"Found {len(archives)} archive(s) and {len(directories)} directory(ies).")
             
             if total == 0:
-                self._set_status('No archives or Takeout directories found in the selected folder.')
+                # No Takeout content found - show the folder with appropriate label
+                self._show_no_takeout_found()
+                self._set_status('No Takeout content found in the selected folder.')
                 self._enable_scan_buttons()
                 return
             
@@ -604,6 +632,54 @@ class TakeoutScoutGUI(tk.Tk):
         finally:
             self._enable_scan_buttons()
             self._stop_current_spinner()
+
+    def _show_no_takeout_found(self) -> None:
+        """Display the folder when no Takeout content is found."""
+        if not self._root_dir:
+            return
+        
+        # Quick scan to get basic file stats
+        try:
+            file_count = 0
+            total_size = 0
+            for root, _dirs, files in os.walk(self._root_dir):
+                file_count += len(files)
+                for f in files:
+                    try:
+                        total_size += (Path(root) / f).stat().st_size
+                    except Exception:
+                        pass
+            
+            # Create a summary row
+            summary = ArchiveSummary(
+                path=str(self._root_dir),
+                parts_group=self._root_dir.name,
+                service_guess='(no Takeout found)',
+                file_count=file_count,
+                photos=0,
+                videos=0,
+                json_sidecars=0,
+                other=file_count,
+                compressed_size=total_size,
+            )
+            self._rows = [summary]
+            self._populate_tree()
+        except Exception as e:
+            logger.exception(f"Failed to scan folder: {e}")
+            # Just show basic info
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            self.tree.insert('', tk.END, values=(
+                str(self._root_dir.name),
+                self._root_dir.name,
+                '(no Takeout found)',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+                '—',
+            ))
 
     def _populate_tree(self) -> None:
         for item in self.tree.get_children():
