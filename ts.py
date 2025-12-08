@@ -383,8 +383,8 @@ class TakeoutScoutGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title('Takeout Scout — Google Takeout Scanner (MVP)')
-        self.geometry('1100x600')
-        self.minsize(960, 540)
+        self.geometry('1000x600')
+        self.minsize(800, 500)
         self._root_dir: Optional[Path] = None
         self._rows: List[ArchiveSummary] = []
         self._prev_index: Dict[str, Dict[str, float]] = load_index()
@@ -399,41 +399,59 @@ class TakeoutScoutGUI(tk.Tk):
         top.pack(side=tk.TOP, fill=tk.X)
 
         self.dir_var = tk.StringVar(value='(Choose a folder with Takeout archives or uncompressed Takeout data)')
-        dir_label = ttk.Label(top, textvariable=self.dir_var)
-        dir_label.pack(side=tk.LEFT, padx=(0, 10))
+        dir_label = ttk.Label(top, textvariable=self.dir_var, wraplength=500)
+        dir_label.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
 
-        btn_choose = ttk.Button(top, text='Choose Folder…', command=self.on_choose)
+        btn_frame = ttk.Frame(top)
+        btn_frame.pack(side=tk.TOP, fill=tk.X)
+        
+        btn_choose = ttk.Button(btn_frame, text='Choose Folder…', command=self.on_choose)
         btn_choose.pack(side=tk.LEFT)
 
-        self.btn_scan = ttk.Button(top, text='Scan', command=self.on_scan, state=tk.DISABLED)
+        self.btn_scan = ttk.Button(btn_frame, text='Scan', command=self.on_scan, state=tk.DISABLED)
         self.btn_scan.pack(side=tk.LEFT, padx=(10, 0))
 
-        self.btn_export = ttk.Button(top, text='Export CSV', command=self.on_export, state=tk.DISABLED)
+        self.btn_export = ttk.Button(btn_frame, text='Export CSV', command=self.on_export, state=tk.DISABLED)
         self.btn_export.pack(side=tk.LEFT, padx=(10, 0))
 
-        self.btn_logs = ttk.Button(top, text='Open Logs…', command=self.on_open_logs)
+        self.btn_logs = ttk.Button(btn_frame, text='Open Logs…', command=self.on_open_logs)
         self.btn_logs.pack(side=tk.RIGHT)
 
+        # Create frame for tree and scrollbars
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        
         cols = ('archive', 'parts', 'service', 'files', 'photos', 'videos', 'json', 'other', 'size')
-        self.tree = ttk.Treeview(self, columns=cols, show='headings')
-        for key, title, width, anchor in (
-            ('archive','Source',380,tk.W),
-            ('parts','Group/Name',220,tk.W),
-            ('service','Service Guess',160,tk.W),
-            ('files','Files',70,tk.E),
-            ('photos','Photos',70,tk.E),
-            ('videos','Videos',70,tk.E),
-            ('json','JSON Sidecars',110,tk.E),
-            ('other','Other',70,tk.E),
-            ('size','Total Size',140,tk.E),
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings')
+        for key, title, width, minwidth, anchor, stretch in (
+            ('archive','Source',250,150,tk.W,True),
+            ('parts','Group/Name',150,100,tk.W,True),
+            ('service','Service',100,80,tk.W,False),
+            ('files','Files',60,50,tk.E,False),
+            ('photos','Photos',60,50,tk.E,False),
+            ('videos','Videos',60,50,tk.E,False),
+            ('json','JSON',60,50,tk.E,False),
+            ('other','Other',60,50,tk.E,False),
+            ('size','Size',100,80,tk.E,False),
         ):
             self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, anchor=anchor)
+            self.tree.column(key, width=width, minwidth=minwidth, anchor=anchor, stretch=stretch)
 
-        vsb = ttk.Scrollbar(self, orient='vertical', command=self.tree.yview)
+        # Vertical scrollbar
+        vsb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=(0, 10))
-        vsb.pack(side=tk.RIGHT, fill=tk.Y, pady=(0, 10))
+        
+        # Horizontal scrollbar
+        hsb = ttk.Scrollbar(tree_frame, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(xscrollcommand=hsb.set)
+        
+        # Grid layout for tree and scrollbars
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+        
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
 
         # Progress area
         prog = ttk.Frame(self, padding=(10, 0))
