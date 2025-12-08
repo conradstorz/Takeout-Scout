@@ -408,7 +408,7 @@ class TakeoutScoutGUI(tk.Tk):
         btn_choose = ttk.Button(btn_frame, text='Choose Folder…', command=self.on_choose)
         btn_choose.pack(side=tk.LEFT)
 
-        self.btn_scan = ttk.Button(btn_frame, text='Scan', command=self.on_scan, state=tk.DISABLED)
+        self.btn_scan = ttk.Button(btn_frame, text='Scan All', command=self.on_scan, state=tk.DISABLED)
         self.btn_scan.pack(side=tk.LEFT, padx=(10, 0))
 
         self.btn_export = ttk.Button(btn_frame, text='Export CSV', command=self.on_export, state=tk.DISABLED)
@@ -421,9 +421,10 @@ class TakeoutScoutGUI(tk.Tk):
         tree_frame = ttk.Frame(self)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         
-        cols = ('archive', 'parts', 'service', 'files', 'photos', 'videos', 'json', 'other', 'size')
+        cols = ('action', 'archive', 'parts', 'service', 'files', 'photos', 'videos', 'json', 'other', 'size')
         self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings')
         for key, title, width, minwidth, anchor, stretch in (
+            ('action','Action',70,70,tk.CENTER,False),
             ('archive','Source',250,150,tk.W,True),
             ('parts','Group/Name',150,100,tk.W,True),
             ('service','Service',100,80,tk.W,False),
@@ -436,6 +437,9 @@ class TakeoutScoutGUI(tk.Tk):
         ):
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, minwidth=minwidth, anchor=anchor, stretch=stretch)
+
+        # Bind click event to handle scan button clicks
+        self.tree.bind('<Button-1>', self._on_tree_click)
 
         # Vertical scrollbar
         vsb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
@@ -498,6 +502,7 @@ class TakeoutScoutGUI(tk.Tk):
         
         # Show the selected folder as pending scan
         self.tree.insert('', tk.END, values=(
+            '[Scan]',
             str(self._root_dir.name),
             '(pending scan)',
             '(pending scan)',
@@ -507,7 +512,110 @@ class TakeoutScoutGUI(tk.Tk):
             '—',
             '—',
             '—',
+        ), tags=('scannable',))
+
+    def _on_tree_click(self, event) -> None:
+        """Handle clicks on the tree, specifically on the Action column."""
+        region = self.tree.identify_region(event.x, event.y)
+        if region == 'cell':
+            column = self.tree.identify_column(event.x)
+            row = self.tree.identify_row(event.y)
+            
+            # Check if clicked on Action column (column #0 is the first column)
+            if column == '#1' and row:  # #1 is the 'action' column
+                # Check if this row has a scan button
+                values = self.tree.item(row, 'values')
+                if values and values[0] == '[Scan]':
+                    # Trigger scan for this specific item
+                    self._scan_single_item(row)
+
+    def _scan_single_item(self, item_id: str) -> None:
+        """Scan a single item from the tree."""
+        values = self.tree.item(item_id, 'values')
+        if not values:
+            return
+        
+        # Get the path from the row (second column is the source)
+        source_name = values[1]
+        
+        # Find the actual path
+        target_path = None
+        if self._root_dir and self._root_dir.name == source_name:
+            target_path = self._root_dir
+        else:
+            # Try to find it in our current directory
+            if self._root_dir:
+                potential = self._root_dir / source_name
+                if potential.exists():
+                    target_path = potential
+        
+        if not target_path:
+            self.status('Could not find item to scan.')
+            return
+        
+        # Update the row to show scanning
+        self.tree.item(item_id, values=(
+            '[...]',
+            values[1],
+            '(scanning...)',
+            values[3],
+            '—',
+            '—',
+            '—',
+            '—',
+            '—',
+            '—',
         ))
+        
+        # Launch scan in background thread
+        threading.Thread(target=self._scan_single_item_thread, args=(item_id, target_path), daemon=True).start()
+
+    def _scan_single_item_thread(self, item_id: str, path: Path) -> None:
+        """Background thread to scan a single item."""
+        try:
+            if path.is_file():
+                # It's an archive
+                summary = scan_archive(path)
+            else:
+                # It's a directory
+                summary = scan_directory(path)
+            
+            # Update the tree with results
+            def update():
+                self.tree.item(item_id, values=(
+                    '[✓]',  # Checkmark to show it's been scanned
+                    Path(summary.path).name,
+                    summary.parts_group if summary.parts_group != Path(summary.path).name else '—',
+                    summary.service_guess,
+                    summary.file_count,
+                    summary.photos,
+                    summary.videos,
+                    summary.json_sidecars,
+                    summary.other,
+                    human_size(summary.compressed_size),
+                ))
+                self.status(f'Scanned: {Path(summary.path).name}')
+            
+            self._ui(update)
+            
+        except Exception as e:
+            logger.exception(f"Failed to scan {path}: {e}")
+            def error_update():
+                values = self.tree.item(item_id, 'values')
+                self.tree.item(item_id, values=(
+                    '[X]',
+                    values[1] if values else str(path.name),
+                    '(error)',
+                    str(e)[:50],
+                    '—',
+                    '—',
+                    '—',
+                    '—',
+                    '—',
+                    '—',
+                ))
+                self.status(f'Error scanning: {path.name}')
+            self._ui(error_update)
 
     def on_scan(self) -> None:
         if not self._root_dir:
@@ -670,6 +778,7 @@ class TakeoutScoutGUI(tk.Tk):
             for item in self.tree.get_children():
                 self.tree.delete(item)
             self.tree.insert('', tk.END, values=(
+                '[✓]',
                 str(self._root_dir.name),
                 self._root_dir.name,
                 '(no Takeout found)',
@@ -692,6 +801,7 @@ class TakeoutScoutGUI(tk.Tk):
             if parts_counter[r.parts_group] > 1:
                 part_suffix = f' ({parts_counter[r.parts_group]} files)'
             self.tree.insert('', tk.END, values=(
+                '[✓]',  # Checkmark for already scanned
                 (lambda b: f"{b}  [NEW]" if b in new_basenames else b)(Path(r.path).name),
                 f'{r.parts_group}{part_suffix}',
                 r.service_guess,
