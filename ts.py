@@ -288,15 +288,91 @@ def scan_archive(path: Path) -> ArchiveSummary:
     )
 
 
-def find_archives(root: Path) -> List[Path]:
-    pats = {'.zip', '.tgz'}
-    results: List[Path] = []
-    for dirpath, _dirnames, filenames in os.walk(root):
+def scan_directory(path: Path) -> ArchiveSummary:
+    """Scan an uncompressed directory and return a summary."""
+    try:
+        files: List[str] = []
+        total_size = 0
+        for root, _dirs, filenames in os.walk(path):
+            for name in filenames:
+                file_path = Path(root) / name
+                try:
+                    total_size += file_path.stat().st_size
+                except Exception:
+                    pass
+                # Make relative path for service detection
+                rel_path = str(file_path.relative_to(path))
+                files.append(rel_path)
+        
+        photos, videos, jsons, other = tally_exts(files)
+        svc = guess_service_from_members(files)
+        
+        return ArchiveSummary(
+            path=str(path),
+            parts_group=path.name,
+            service_guess=svc,
+            file_count=len(files),
+            photos=photos,
+            videos=videos,
+            json_sidecars=jsons,
+            other=other,
+            compressed_size=total_size,
+        )
+    except Exception as e:
+        logger.exception(f"Failed to scan directory {path}: {e}")
+        return ArchiveSummary(
+            path=str(path),
+            parts_group=path.name,
+            service_guess='(error)',
+            file_count=0,
+            photos=0,
+            videos=0,
+            json_sidecars=0,
+            other=0,
+            compressed_size=0,
+        )
+
+
+def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
+    """Find both archives and Takeout directories.
+    Returns (archives, directories)
+    """
+    archives: List[Path] = []
+    directories: List[Path] = []
+    
+    # Check if the root itself is a Takeout directory
+    if root.is_dir():
+        # Look for telltale signs of a Takeout folder
+        root_contents = list(root.iterdir())
+        has_takeout_marker = any(
+            'takeout' in item.name.lower() or 
+            item.name in {'Google Photos', 'Google Drive', 'Google Maps'}
+            for item in root_contents if item.is_dir()
+        )
+        
+        if has_takeout_marker:
+            directories.append(root)
+            logger.info(f"Root folder appears to be a Takeout directory: {root}")
+    
+    # Walk the tree for archives and subdirectories
+    for dirpath, dirnames, filenames in os.walk(root):
+        current_dir = Path(dirpath)
+        
+        # Find archives
         for name in filenames:
             lower = name.lower()
             if lower.endswith('.zip') or lower.endswith('.tgz') or lower.endswith('.tar.gz'):
-                results.append(Path(dirpath) / name)
-    return sorted(results)
+                archives.append(current_dir / name)
+        
+        # Find Takeout directories (one level deep to avoid duplicates)
+        if current_dir == root:
+            for dirname in dirnames:
+                subdir = current_dir / dirname
+                # Check if it looks like a Takeout folder
+                if 'takeout' in dirname.lower():
+                    directories.append(subdir)
+    
+    return sorted(archives), sorted(directories)
 
 
 # --- GUI ---------------------------------------------------------------------
@@ -322,7 +398,7 @@ class TakeoutScoutGUI(tk.Tk):
         top = ttk.Frame(self, padding=(10, 10))
         top.pack(side=tk.TOP, fill=tk.X)
 
-        self.dir_var = tk.StringVar(value='(Choose a folder that contains your Takeout archives)')
+        self.dir_var = tk.StringVar(value='(Choose a folder with Takeout archives or uncompressed Takeout data)')
         dir_label = ttk.Label(top, textvariable=self.dir_var)
         dir_label.pack(side=tk.LEFT, padx=(0, 10))
 
@@ -341,15 +417,15 @@ class TakeoutScoutGUI(tk.Tk):
         cols = ('archive', 'parts', 'service', 'files', 'photos', 'videos', 'json', 'other', 'size')
         self.tree = ttk.Treeview(self, columns=cols, show='headings')
         for key, title, width, anchor in (
-            ('archive','Archive',380,tk.W),
-            ('parts','Parts Group',220,tk.W),
+            ('archive','Source',380,tk.W),
+            ('parts','Group/Name',220,tk.W),
             ('service','Service Guess',160,tk.W),
             ('files','Files',70,tk.E),
             ('photos','Photos',70,tk.E),
             ('videos','Videos',70,tk.E),
             ('json','JSON Sidecars',110,tk.E),
             ('other','Other',70,tk.E),
-            ('size','Compressed Size',140,tk.E),
+            ('size','Total Size',140,tk.E),
         ):
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, anchor=anchor)
@@ -381,7 +457,7 @@ class TakeoutScoutGUI(tk.Tk):
 
     # Handlers
     def on_choose(self) -> None:
-        chosen = filedialog.askdirectory(title='Select folder containing Google Takeout archives')
+        chosen = filedialog.askdirectory(title='Select folder with Google Takeout archives or data')
         if chosen:
             self._root_dir = Path(chosen)
             self.dir_var.set(str(self._root_dir))
@@ -405,17 +481,53 @@ class TakeoutScoutGUI(tk.Tk):
     def _scan_thread(self) -> None:
         start = time.time()
         try:
-            archives = find_archives(self._root_dir or Path('.'))
-            total = len(archives)
-            logger.info(f"Found {total} archive(s).")
+            archives, directories = find_archives_and_dirs(self._root_dir or Path('.'))
+            total = len(archives) + len(directories)
+            logger.info(f"Found {len(archives)} archive(s) and {len(directories)} directory(ies).")
+            
+            if total == 0:
+                self._set_status('No archives or Takeout directories found in the selected folder.')
+                self._enable_scan_buttons()
+                return
+            
             rows: List[ArchiveSummary] = []
             current_index: Dict[str, Dict[str, float]] = {}
             self._set_overall_progress(0, max(1, total))
+            
+            # Scan directories first
+            item_count = 0
+            for i, d in enumerate(directories, 1):
+                if self._cancel_evt.is_set():
+                    logger.info('Scan canceled by user.')
+                    break
+                item_count += 1
+                self._set_current_label(f'Current directory: {d.name} ({item_count}/{total})')
+                self._current_progress_start(0)  # Indeterminate for directories
+                
+                r = scan_directory(d)
+                rows.append(r)
+                
+                try:
+                    st = d.stat()
+                    current_index[str(d.resolve())] = {'size': float(r.compressed_size), 'mtime': float(st.st_mtime)}
+                except Exception:
+                    pass
+                
+                # Update overall progress and ETA
+                self._set_overall_progress(item_count, max(1, total))
+                elapsed = time.time() - start
+                rate = item_count / elapsed if elapsed > 0 else 0
+                remaining = (total - item_count) / rate if rate > 0 else 0
+                eta = time.strftime('%M:%S', time.gmtime(max(0, int(remaining))))
+                self._set_status(f'Scanned {item_count}/{total} items • ETA ~ {eta}')
+            
+            # Then scan archives
             for i, a in enumerate(archives, 1):
                 if self._cancel_evt.is_set():
                     logger.info('Scan canceled by user.')
                     break
-                self._set_current_label(f'Current archive: {a.name} ({i}/{total})')
+                item_count += 1
+                self._set_current_label(f'Current archive: {a.name} ({item_count}/{total})')
                 # Per-archive progress
                 members = iter_members_with_progress(a, self._current_progress_start, self._current_progress_tick)
                 # Build summary from members
@@ -443,12 +555,12 @@ class TakeoutScoutGUI(tk.Tk):
                 except Exception:
                     pass
                 # Update overall progress and ETA
-                self._set_overall_progress(i, max(1, total))
+                self._set_overall_progress(item_count, max(1, total))
                 elapsed = time.time() - start
-                rate = i / elapsed if elapsed > 0 else 0
-                remaining = (total - i) / rate if rate > 0 else 0
+                rate = item_count / elapsed if elapsed > 0 else 0
+                remaining = (total - item_count) / rate if rate > 0 else 0
                 eta = time.strftime('%M:%S', time.gmtime(max(0, int(remaining))))
-                self._set_status(f'Scanned {i}/{total} archives • ETA ~ {eta}')
+                self._set_status(f'Scanned {item_count}/{total} items • ETA ~ {eta}')
             # Diff and persist index
             prev_paths = set(self._prev_index.keys())
             curr_paths = set(current_index.keys())
