@@ -1,20 +1,23 @@
 # Takeout Scout
 
-A lightweight, GUI-based tool for scanning and analyzing Google Takeout archives without extraction.
+A modern, web-based tool for scanning and analyzing Google Takeout archives without extraction.
 
 ## Features
 
+- **🌐 Web Interface** - Clean, modern UI that runs in your browser
 - **Non-destructive scanning** - Analyzes ZIP and TGZ archives without extracting
 - **Smart detection** - Identifies content types (photos, videos, JSON sidecars) and Google services
 - **Multi-part support** - Groups related archive parts together
-- **Change tracking** - Detects new and missing archives between scans
+- **Flexible input** - Select folders or individual files
+- **Real-time progress** - See scanning progress as it happens
+- **Interactive tables** - Sort and filter results
 - **CSV export** - Export summaries for further analysis
 - **Rotating logs** - Comprehensive logging with automatic rotation
 
 ## Requirements
 
 - Python 3.8+
-- Standard library only (tkinter included with Python)
+- Streamlit (included in dependencies)
 - Optional: `loguru` for enhanced logging (falls back to standard logging)
 
 ## Installation
@@ -55,40 +58,61 @@ pip install -e .
 
 ## Usage
 
-Run the application:
+Run the web application:
 ```bash
-python ts.py
+streamlit run app.py
 ```
+
+Or use uv:
+```bash
+uv run streamlit run app.py
+```
+
+The app will automatically open in your default web browser at `http://localhost:8501`.
 
 ### Workflow
 
-1. **Choose Folder** - Select the directory containing your Google Takeout archives
-2. **Scan** - The tool will scan all ZIP/TGZ files and summarize their contents
-3. **Review** - View the summary table showing:
-   - Archive names (multi-part archives are grouped)
-   - Service detection (Google Photos, Drive, etc.)
-   - File counts by type (photos, videos, JSON sidecars)
-   - Compressed sizes
-4. **Export CSV** - Save the summary for record-keeping or further analysis
+**Folder Mode:**
+1. Copy a folder path from File Explorer (e.g., `D:\My Takeout\`)
+2. Paste it in the sidebar "Folder Path" field
+3. Click "📁 Scan Folder"
 
-### Change Detection
+**Files Mode:**
+1. Select "Files" mode in the sidebar
+2. Select files in File Explorer, Shift+Right-Click and choose "Copy as path"
+3. Paste paths into the text area (one per line)
+4. Click "📄 Scan Files"
 
-On subsequent scans, Takeout Scout will:
-- Highlight newly added archives with a **[NEW]** tag
-- Report missing archives since the last scan
-- Maintain a persistent index in `state/takeout_index.json`
+### Features in the Web UI
+
+- **Interactive Table** - Sort columns, view all results at a glance
+- **Real-time Progress** - Progress bar shows scanning status
+- **Summary Stats** - Total counts for files, photos, videos, JSON, and size
+- **CSV Export** - Download results with timestamp
+- **Clear Results** - Start fresh with one click
+
+## Legacy Tkinter Version
+
+The original tkinter desktop version is still available as `ts.py`:
+```bash
+python ts.py
+# or
+uv run python ts.py
+```
 
 ## Project Structure
 
 ```
 Takeout_Scout/
-├── ts.py                      # Main application
+├── app.py                     # Streamlit web application (recommended)
+├── ts.py                      # Legacy tkinter desktop app
 ├── logs/                      # Log files (auto-created)
 │   └── takeout_scout.log
 ├── state/                     # Persistent state (auto-created)
 │   └── takeout_index.json
 ├── README.md                  # This file
 ├── LICENSE                    # MIT License
+├── pyproject.toml             # Project configuration
 └── .gitignore                 # Git ignore rules
 ```
 

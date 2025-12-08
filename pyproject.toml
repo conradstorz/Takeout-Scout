@@ -1,14 +1,14 @@
 [project]
 name = "takeout-scout"
-version = "0.1.0"
-description = "A lightweight GUI tool for scanning and analyzing Google Takeout archives"
+version = "0.2.0"
+description = "A web-based tool for scanning and analyzing Google Takeout archives"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "Conrad", email = "conrad@example.com" }
 ]
-keywords = ["google", "takeout", "backup", "scanner", "archive"]
+keywords = ["google", "takeout", "backup", "scanner", "archive", "streamlit"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
@@ -23,13 +23,18 @@ classifiers = [
     "Topic :: Utilities",
 ]
 
-dependencies = []
+dependencies = [
+    "streamlit>=1.50.0",
+    "pandas>=2.0.0",
+]
 
 [project.optional-dependencies]
 logging = ["loguru>=0.7.0"]
+tkinter = []  # For the legacy ts.py version
 
 [project.scripts]
-takeout-scout = "ts:main"
+takeout-scout = "app:main"
+takeout-scout-tk = "ts:main"
 
 [project.urls]
 Homepage = "https://github.com/conradstorz/Takeout-Scout"
