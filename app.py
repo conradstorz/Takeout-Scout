@@ -487,10 +487,12 @@ def scan_directory(path: Path) -> ArchiveSummary:
 
 
 def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
-    """Find both archives and Takeout directories."""
+    """Find both archives and Takeout directories by recursively searching all subdirectories."""
     archives: List[Path] = []
     directories: List[Path] = []
+    seen_dirs = set()  # Track directories we've already added
     
+    # Check if root itself is a Takeout directory
     if root.is_dir():
         root_contents = list(root.iterdir())
         has_takeout_marker = any(
@@ -501,22 +503,29 @@ def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
         
         if has_takeout_marker:
             directories.append(root)
+            seen_dirs.add(root)
             logger.info(f"Root folder appears to be a Takeout directory: {root}")
     
+    # Recursively walk through all subdirectories
     for dirpath, dirnames, filenames in os.walk(root):
         current_dir = Path(dirpath)
         
+        # Find all archive files
         for name in filenames:
             lower = name.lower()
             if lower.endswith('.zip') or lower.endswith('.tgz') or lower.endswith('.tar.gz'):
                 archives.append(current_dir / name)
         
-        if current_dir == root:
-            for dirname in dirnames:
+        # Find all directories containing "takeout" in the name (recursively)
+        for dirname in dirnames:
+            if 'takeout' in dirname.lower():
                 subdir = current_dir / dirname
-                if 'takeout' in dirname.lower():
+                if subdir not in seen_dirs:
                     directories.append(subdir)
+                    seen_dirs.add(subdir)
+                    logger.info(f"Found Takeout directory: {subdir}")
     
+    logger.info(f"Found {len(archives)} archives and {len(directories)} Takeout directories in {root}")
     return sorted(archives), sorted(directories)
 
 
