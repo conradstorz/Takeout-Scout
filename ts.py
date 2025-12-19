@@ -1325,6 +1325,32 @@ def perform_deep_scan(file_path: str, index: int):
         st.error(f"❌ Deep scan failed: {e}")
 
 
+def build_folder_tree(folder_paths: List[str]) -> dict:
+    """Build a hierarchical tree structure from folder paths."""
+    tree = {}
+    
+    for path in sorted(folder_paths):
+        parts = path.split('/') if '/' in path else path.split('\\')
+        current = tree
+        
+        for part in parts:
+            if part:  # Skip empty parts
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+    
+    return tree
+
+
+def display_folder_tree(tree: dict, indent: int = 0):
+    """Display folder tree in a hierarchical format."""
+    for name, subtree in sorted(tree.items()):
+        prefix = "  " * indent + ("└─ " if indent > 0 else "📁 ")
+        st.markdown(f"`{prefix}{name}`")
+        if subtree:
+            display_folder_tree(subtree, indent + 1)
+
+
 def display_deep_scan_card(result: DeepScanResult):
     """Display detailed deep scan results in an expandable card."""
     with st.expander("📊 View Deep Scan Details", expanded=True):
@@ -1362,17 +1388,28 @@ def display_deep_scan_card(result: DeepScanResult):
         if result.albums:
             st.markdown(f"#### 📚 Albums ({len(result.albums)})")
             if len(result.albums) <= 10:
-                st.write(", ".join(result.albums))
+                for album in result.albums:
+                    st.markdown(f"- {album}")
             else:
                 with st.expander(f"Show all {len(result.albums)} albums"):
-                    st.write(", ".join(result.albums))
+                    for album in result.albums:
+                        st.markdown(f"- {album}")
         
         # Top Folders
         if result.folder_structure:
-            st.markdown("#### 📂 Top Folders by File Count")
+            st.markdown("#### 📂 Folder Structure")
+            
+            # Show top 10 by file count
             top_folders = sorted(result.folder_structure.items(), key=lambda x: x[1], reverse=True)[:10]
             folder_df = pd.DataFrame(top_folders, columns=["Folder", "Files"])
             st.dataframe(folder_df, hide_index=True, use_container_width=True)
+            
+            # Show all folders in a hierarchical view
+            if len(result.folder_structure) > 10:
+                with st.expander(f"📂 Show all {len(result.folder_structure)} folders"):
+                    # Build hierarchical structure
+                    folder_tree = build_folder_tree(list(result.folder_structure.keys()))
+                    display_folder_tree(folder_tree)
         
         # Issues Found
         if result.issues:
