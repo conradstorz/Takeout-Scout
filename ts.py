@@ -339,6 +339,7 @@ def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
     """
     archives: List[Path] = []
     directories: List[Path] = []
+    seen_dirs = set()  # Track directories we've already added
     
     # Check if the root itself is a Takeout directory
     if root.is_dir():
@@ -352,26 +353,30 @@ def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
         
         if has_takeout_marker:
             directories.append(root)
+            seen_dirs.add(root)
             logger.info(f"Root folder appears to be a Takeout directory: {root}")
     
-    # Walk the tree for archives and subdirectories
+    # Walk the tree recursively for archives and subdirectories
     for dirpath, dirnames, filenames in os.walk(root):
         current_dir = Path(dirpath)
         
-        # Find archives
+        # Find archive files containing "takeout" in the filename
         for name in filenames:
             lower = name.lower()
-            if lower.endswith('.zip') or lower.endswith('.tgz') or lower.endswith('.tar.gz'):
+            if 'takeout' in lower and (lower.endswith('.zip') or lower.endswith('.tgz') or lower.endswith('.tar.gz')):
                 archives.append(current_dir / name)
+                logger.info(f"Found Takeout archive: {current_dir / name}")
         
-        # Find Takeout directories (one level deep to avoid duplicates)
-        if current_dir == root:
-            for dirname in dirnames:
+        # Find all directories containing "takeout" in the name (recursively)
+        for dirname in dirnames:
+            if 'takeout' in dirname.lower():
                 subdir = current_dir / dirname
-                # Check if it looks like a Takeout folder
-                if 'takeout' in dirname.lower():
+                if subdir not in seen_dirs:
                     directories.append(subdir)
+                    seen_dirs.add(subdir)
+                    logger.info(f"Found Takeout directory: {subdir}")
     
+    logger.info(f"Found {len(archives)} archives and {len(directories)} Takeout directories in {root}")
     return sorted(archives), sorted(directories)
 
 
