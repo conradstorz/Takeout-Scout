@@ -33,8 +33,7 @@ logging = ["loguru>=0.7.0"]
 tkinter = []  # For the legacy ts.py version
 
 [project.scripts]
-takeout-scout = "app:main"
-takeout-scout-tk = "ts:main"
+takeout-scout = "takeout_scout:main"
 
 [project.urls]
 Homepage = "https://github.com/conradstorz/Takeout-Scout"

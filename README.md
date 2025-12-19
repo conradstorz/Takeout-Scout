@@ -60,12 +60,17 @@ pip install -e .
 
 Run the web application:
 ```bash
-streamlit run app.py
+streamlit run ts.py
 ```
 
 Or use uv:
 ```bash
-uv run streamlit run app.py
+uv run streamlit run ts.py
+```
+
+Or use the convenience launcher (after installation):
+```bash
+uv run takeout-scout
 ```
 
 The app will automatically open in your default web browser at `http://localhost:8501`.
