@@ -550,11 +550,12 @@ def find_archives_and_dirs(root: Path, progress_callback=None) -> Tuple[List[Pat
             )
         current_dir = Path(dirpath)
         
-        # Find all archive files
+        # Find archive files containing "takeout" in the filename
         for name in filenames:
             lower = name.lower()
-            if lower.endswith('.zip') or lower.endswith('.tgz') or lower.endswith('.tar.gz'):
+            if 'takeout' in lower and (lower.endswith('.zip') or lower.endswith('.tgz') or lower.endswith('.tar.gz')):
                 archives.append(current_dir / name)
+                logger.info(f"Found Takeout archive: {current_dir / name}")
         
         # Find all directories containing "takeout" in the name (recursively)
         for dirname in dirnames:
