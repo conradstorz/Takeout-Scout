@@ -1,33 +1,23 @@
 #!/usr/bin/env python3
 """
-Takeout Scout — Google Takeout Scanner (MVP)
+Takeout Scout — Google Takeout Scanner (Streamlit Web UI)
 
-A small, re-runnable GUI utility that:
-  • Asks where to look for Google Takeout archives (ZIP/TGZ)
+A web-based utility that:
+  • Lets you select folders or files containing Google Takeout archives
   • Scans archives non-destructively and summarizes their contents
-  • Presents a prettified table (per-archive) with counts of photos/videos/JSON sidecars
+  • Presents an interactive table with counts of photos/videos/JSON sidecars
+  • Supports individual or batch scanning
   • Exports the summary to CSV
   • Logs all actions to ./logs/takeout_scout.log (rotated)
-
-Design notes:
-  • Pure standard library + loguru (optional but recommended). If loguru is not installed,
-    it falls back to a minimal logger.
-  • Idempotent and safe to re-run; does not modify archives.
-  • Future steps (unpack, merge JSON→EXIF, dedupe, organize) can be added as additional
-    buttons without changing the scan step. Each step should write to its own output
-    directory so that runs are “restful.”
 
 Author: ChatGPT for Conrad
 License: MIT
 """
 from __future__ import annotations
 
-import csv
 import os
 import re
-import sys
 import tarfile
-import threading
 import time
 import zipfile
 from collections import Counter, defaultdict
@@ -35,14 +25,53 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from enum import Enum
+
+import streamlit as st
+import pandas as pd
+
+
+# --- File status enum --------------------------------------------------------
+class FileStatus(Enum):
+    PENDING = "pending"
+    VALID = "valid"
+    INVALID = "invalid"
+    SCANNING = "scanning"
+    SCANNED = "scanned"
+    ERROR = "error"
+
+
+# --- File info dataclass -----------------------------------------------------
+@dataclass
+class FileInfo:
+    """Quick metadata about a file without deep scanning."""
+    path: Path
+    name: str
+    size: int
+    status: FileStatus
+    is_valid: bool
+    error_message: Optional[str] = None
+    file_type: Optional[str] = None  # 'zip', 'tgz', 'directory'
+    
+    def to_dict(self) -> dict:
+        return {
+            'path': str(self.path),
+            'name': self.name,
+            'size': self.size,
+            'size_human': human_size(self.size),
+            'status': self.status.value,
+            'is_valid': self.is_valid,
+            'error_message': self.error_message,
+            'file_type': self.file_type,
+        }
 
 # --- Logging setup -----------------------------------------------------------
 try:
-    from loguru import logger  # type: ignore
+    from loguru import logger
     _HAS_LOGURU = True
-except Exception:  # pragma: no cover
+except Exception:
     import logging
-
+    
     class _Shim:
         def __init__(self) -> None:
             logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -57,7 +86,7 @@ except Exception:  # pragma: no cover
             self._log.exception(msg, *a, **kw)
         def debug(self, msg: str, *a, **kw):
             self._log.debug(msg, *a, **kw)
-    logger = _Shim()  # type: ignore
+    logger = _Shim()
     _HAS_LOGURU = False
 
 LOG_DIR = Path('logs')
@@ -79,9 +108,10 @@ import json
 STATE_DIR = Path('state')
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_PATH = STATE_DIR / 'takeout_index.json'
+RECENT_FOLDERS_PATH = STATE_DIR / 'recent_folders.json'
+MAX_RECENT_FOLDERS = 10
 
-# --- Simple size helpers -----------------------------------------------------
-
+# --- File type definitions ---------------------------------------------------
 MEDIA_PHOTO_EXT = {
     '.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.raw', '.dng', '.arw', '.cr2', '.nef'
 }
@@ -112,7 +142,6 @@ def human_size(n: int) -> str:
 
 
 # --- Index helpers -----------------------------------------------------------
-
 def load_index() -> Dict[str, Dict[str, float]]:
     """Load mapping of absolute archive path -> {size, mtime}."""
     if INDEX_PATH.exists():
@@ -131,8 +160,50 @@ def save_index(index: Dict[str, Dict[str, float]]) -> None:
     except Exception as e:
         logger.exception(f'Failed to save index: {e}')
 
-# --- Data model --------------------------------------------------------------
 
+# --- Recent folders helpers --------------------------------------------------
+def load_recent_folders() -> List[str]:
+    """Load list of recently accessed folders."""
+    if RECENT_FOLDERS_PATH.exists():
+        try:
+            with open(RECENT_FOLDERS_PATH, 'r', encoding='utf-8') as f:
+                folders = json.load(f)
+                # Filter to only existing folders
+                return [f for f in folders if Path(f).exists()]
+        except Exception:
+            logger.warning('Recent folders file unreadable; starting fresh.')
+    return []
+
+
+def save_recent_folders(folders: List[str]) -> None:
+    """Save list of recent folders."""
+    try:
+        with open(RECENT_FOLDERS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(folders, f, indent=2)
+    except Exception as e:
+        logger.exception(f'Failed to save recent folders: {e}')
+
+
+def add_recent_folder(folder_path: str) -> None:
+    """Add a folder to recent folders list."""
+    recent = st.session_state.recent_folders
+    folder_path = str(Path(folder_path).resolve())
+    
+    # Remove if already in list
+    if folder_path in recent:
+        recent.remove(folder_path)
+    
+    # Add to front
+    recent.insert(0, folder_path)
+    
+    # Keep only MAX_RECENT_FOLDERS
+    recent = recent[:MAX_RECENT_FOLDERS]
+    
+    st.session_state.recent_folders = recent
+    save_recent_folders(recent)
+
+
+# --- Data model --------------------------------------------------------------
 @dataclass
 class ArchiveSummary:
     path: str
@@ -145,22 +216,21 @@ class ArchiveSummary:
     other: int
     compressed_size: int
 
-    def to_row(self) -> List[str]:
-        return [
-            self.path,
-            self.parts_group,
-            self.service_guess,
-            str(self.file_count),
-            str(self.photos),
-            str(self.videos),
-            str(self.json_sidecars),
-            str(self.other),
-            human_size(self.compressed_size),
-        ]
+    def to_dict(self) -> dict:
+        return {
+            'Path': Path(self.path).name,
+            'Parts Group': self.parts_group,
+            'Service': self.service_guess,
+            'Files': self.file_count,
+            'Photos': self.photos,
+            'Videos': self.videos,
+            'JSON': self.json_sidecars,
+            'Other': self.other,
+            'Size': human_size(self.compressed_size),
+        }
 
 
 # --- Scanner -----------------------------------------------------------------
-
 def guess_service_from_members(members: Iterable[str]) -> str:
     joined = '\n'.join(members)
     for name, pat in SERVICE_HINTS.items():
@@ -180,6 +250,7 @@ def iter_tar_members(tf: tarfile.TarFile) -> Iterable[str]:
         if m.isfile():
             yield m.name.lstrip('./')
 
+
 def tally_exts(paths: Iterable[str]) -> Tuple[int, int, int, int]:
     photos = videos = jsons = other = 0
     for p in paths:
@@ -194,45 +265,128 @@ def tally_exts(paths: Iterable[str]) -> Tuple[int, int, int, int]:
             other += 1
     return photos, videos, jsons, other
 
-# --- Archive iteration with per-archive progress ----------------------------
-
-def iter_members_with_progress(path: Path, start_cb, tick_cb) -> List[str]:
-    """Return a list of file members while calling progress callbacks.
-    start_cb(total) is called once with the number of file entries.
-    tick_cb() is called for each file entry.
-    """
-    members: List[str] = []
-    if path.suffix.lower() == '.zip':
-        with zipfile.ZipFile(path) as zf:
-            infos = [i for i in zf.infolist() if not i.is_dir()]
-            start_cb(len(infos))
-            for i in infos:
-                members.append(i.filename)
-                tick_cb()
-    elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
-        with tarfile.open(path, 'r:*') as tf:
-            files = [m for m in tf.getmembers() if m.isfile()]
-            start_cb(len(files))
-            for m in files:
-                members.append(m.name.lstrip('./'))
-                tick_cb()
-    else:
-        start_cb(0)
-    return members
-
 
 def derive_parts_group(archive_path: Path) -> str:
     m = PARTS_PAT.match(archive_path.stem)
     if m:
         return m.group('prefix')
-    # Also handle Google’s common Takeout-YYYYMMDD…-001.zip style
     m2 = re.match(r'^(Takeout-\d{8}T\d{6}Z-\w+?)-(?:\d{3,})$', archive_path.stem)
     if m2:
         return m2.group(1)
     return archive_path.stem
 
 
-def scan_archive(path: Path) -> ArchiveSummary:
+# --- Quick validation functions ----------------------------------------------
+def validate_and_get_info(path: Path) -> FileInfo:
+    """Quickly validate a file and get basic metadata without deep scanning."""
+    try:
+        if not path.exists():
+            return FileInfo(
+                path=path,
+                name=path.name,
+                size=0,
+                status=FileStatus.INVALID,
+                is_valid=False,
+                error_message="File not found",
+                file_type=None
+            )
+        
+        size = path.stat().st_size
+        
+        # Determine file type
+        if path.is_dir():
+            return FileInfo(
+                path=path,
+                name=path.name,
+                size=size,
+                status=FileStatus.VALID,
+                is_valid=True,
+                file_type='directory'
+            )
+        
+        # Check if it's a zip file
+        if path.suffix.lower() == '.zip':
+            is_valid = validate_zip(path)
+            return FileInfo(
+                path=path,
+                name=path.name,
+                size=size,
+                status=FileStatus.VALID if is_valid else FileStatus.INVALID,
+                is_valid=is_valid,
+                error_message=None if is_valid else "Corrupt or invalid ZIP file",
+                file_type='zip'
+            )
+        
+        # Check if it's a tar/tgz file
+        elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
+            is_valid = validate_tar(path)
+            return FileInfo(
+                path=path,
+                name=path.name,
+                size=size,
+                status=FileStatus.VALID if is_valid else FileStatus.INVALID,
+                is_valid=is_valid,
+                error_message=None if is_valid else "Corrupt or invalid TAR/TGZ file",
+                file_type='tgz'
+            )
+        
+        # Unsupported file type
+        return FileInfo(
+            path=path,
+            name=path.name,
+            size=size,
+            status=FileStatus.INVALID,
+            is_valid=False,
+            error_message="Unsupported file type (only ZIP, TGZ supported)",
+            file_type='unknown'
+        )
+        
+    except Exception as e:
+        logger.exception(f"Error validating {path}: {e}")
+        return FileInfo(
+            path=path,
+            name=path.name if path else "Unknown",
+            size=0,
+            status=FileStatus.ERROR,
+            is_valid=False,
+            error_message=str(e),
+            file_type=None
+        )
+
+
+def validate_zip(path: Path) -> bool:
+    """Validate a ZIP file without extracting it."""
+    try:
+        with zipfile.ZipFile(path, 'r') as zf:
+            # Just verify we can open the ZIP - don't read the full file list
+            # for large archives as it can be slow. Just check the first entry.
+            infolist = zf.infolist()
+            if not infolist:
+                return False  # Empty ZIP
+            # Successfully opened and has at least one file
+            return True
+    except zipfile.BadZipFile:
+        return False
+    except Exception as e:
+        logger.warning(f"ZIP validation error for {path}: {e}")
+        return False
+
+
+def validate_tar(path: Path) -> bool:
+    """Validate a TAR/TGZ file without extracting it."""
+    try:
+        with tarfile.open(path, 'r:*') as tf:
+            # Try to read the member list
+            _ = tf.getmembers()
+            return True
+    except tarfile.TarError:
+        return False
+    except Exception as e:
+        logger.warning(f"TAR validation error for {path}: {e}")
+        return False
+
+
+def scan_archive(path: Path, progress_callback=None) -> ArchiveSummary:
     try:
         size = path.stat().st_size
     except Exception:
@@ -240,12 +394,24 @@ def scan_archive(path: Path) -> ArchiveSummary:
 
     members: List[str] = []
     try:
+        if progress_callback:
+            progress_callback(f"Opening {path.name}...", 0)
+        
         if path.suffix.lower() == '.zip':
             with zipfile.ZipFile(path) as zf:
+                if progress_callback:
+                    total = len(zf.namelist())
+                    progress_callback(f"Reading {total:,} entries from ZIP...", 0.3)
                 members = list(iter_zip_members(zf))
+                if progress_callback:
+                    progress_callback(f"Analyzing {len(members):,} files...", 0.7)
         elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
             with tarfile.open(path, 'r:*') as tf:
+                if progress_callback:
+                    progress_callback(f"Reading entries from TGZ...", 0.3)
                 members = list(iter_tar_members(tf))
+                if progress_callback:
+                    progress_callback(f"Analyzing {len(members):,} files...", 0.7)
         else:
             logger.warning(f"Skipping unsupported archive: {path}")
             return ArchiveSummary(
@@ -288,11 +454,16 @@ def scan_archive(path: Path) -> ArchiveSummary:
     )
 
 
-def scan_directory(path: Path) -> ArchiveSummary:
+def scan_directory(path: Path, progress_callback=None) -> ArchiveSummary:
     """Scan an uncompressed directory and return a summary."""
     try:
         files: List[str] = []
         total_size = 0
+        file_count = 0
+        
+        if progress_callback:
+            progress_callback(f"Scanning directory {path.name}...", 0)
+        
         for root, _dirs, filenames in os.walk(path):
             for name in filenames:
                 file_path = Path(root) / name
@@ -300,9 +471,16 @@ def scan_directory(path: Path) -> ArchiveSummary:
                     total_size += file_path.stat().st_size
                 except Exception:
                     pass
-                # Make relative path for service detection
                 rel_path = str(file_path.relative_to(path))
                 files.append(rel_path)
+                file_count += 1
+                
+                # Update progress every 100 files
+                if progress_callback and file_count % 100 == 0:
+                    progress_callback(f"Found {file_count:,} files...", min(0.8, file_count / 10000))
+        
+        if progress_callback:
+            progress_callback(f"Analyzing {len(files):,} files...", 0.9)
         
         photos, videos, jsons, other = tally_exts(files)
         svc = guess_service_from_members(files)
@@ -333,17 +511,18 @@ def scan_directory(path: Path) -> ArchiveSummary:
         )
 
 
-def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
-    """Find both archives and Takeout directories.
-    Returns (archives, directories)
-    """
+def find_archives_and_dirs(root: Path, progress_callback=None) -> Tuple[List[Path], List[Path]]:
+    """Find both archives and Takeout directories by recursively searching all subdirectories."""
     archives: List[Path] = []
     directories: List[Path] = []
     seen_dirs = set()  # Track directories we've already added
+    dir_count = 0
     
-    # Check if the root itself is a Takeout directory
+    if progress_callback:
+        progress_callback(f"Starting search in {root.name}...", 0.05)
+    
+    # Check if root itself is a Takeout directory
     if root.is_dir():
-        # Look for telltale signs of a Takeout folder
         root_contents = list(root.iterdir())
         has_takeout_marker = any(
             'takeout' in item.name.lower() or 
@@ -355,9 +534,20 @@ def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
             directories.append(root)
             seen_dirs.add(root)
             logger.info(f"Root folder appears to be a Takeout directory: {root}")
+            if progress_callback:
+                progress_callback(f"Found Takeout directory: {root.name}", 0.1)
     
-    # Walk the tree recursively for archives and subdirectories
+    # Recursively walk through all subdirectories
     for dirpath, dirnames, filenames in os.walk(root):
+        dir_count += 1
+        
+        # Update progress more frequently for better feedback
+        if progress_callback and (dir_count % 10 == 0 or dir_count == 1):
+            items_found = len(archives) + len(directories)
+            progress_callback(
+                f"Searched {dir_count} directories, found {items_found} items...", 
+                min(0.9, 0.1 + (dir_count / 500))
+            )
         current_dir = Path(dirpath)
         
         # Find archive files containing "takeout" in the filename
@@ -376,636 +566,651 @@ def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
                     seen_dirs.add(subdir)
                     logger.info(f"Found Takeout directory: {subdir}")
     
+    # Final progress update
+    if progress_callback:
+        total_found = len(archives) + len(directories)
+        progress_callback(f"Search complete: {total_found} items found", 0.95)
+    
     logger.info(f"Found {len(archives)} archives and {len(directories)} Takeout directories in {root}")
     return sorted(archives), sorted(directories)
 
 
-# --- GUI ---------------------------------------------------------------------
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-
-class TakeoutScoutGUI(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title('Takeout Scout — Google Takeout Scanner (MVP)')
-        self.geometry('1000x600')
-        self.minsize(800, 500)
-        self._root_dir: Optional[Path] = None
-        self._selected_files: Optional[List[Path]] = None
-        self._rows: List[ArchiveSummary] = []
-        self._prev_index: Dict[str, Dict[str, float]] = load_index()
-        self._new_paths: set[str] = set()
-        self._missing_paths: set[str] = set()
-        self._cancel_evt = threading.Event()
-        self._build_widgets()
-
-    # UI construction
-    def _build_widgets(self) -> None:
-        top = ttk.Frame(self, padding=(10, 10))
-        top.pack(side=tk.TOP, fill=tk.X)
-
-        self.dir_var = tk.StringVar(value='(Choose a folder with Takeout archives or uncompressed Takeout data)')
-        dir_label = ttk.Label(top, textvariable=self.dir_var, wraplength=500)
-        dir_label.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
-
-        btn_frame = ttk.Frame(top)
-        btn_frame.pack(side=tk.TOP, fill=tk.X)
+# --- Streamlit App -----------------------------------------------------------
+def main():
+    st.set_page_config(
+        page_title="Takeout Scout",
+        page_icon="📦",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    st.title("📦 Takeout Scout")
+    st.markdown("*Google Takeout Scanner - Analyze your archives without extraction*")
+    
+    # Initialize session state
+    if 'results' not in st.session_state:
+        st.session_state.results = []
+    if 'scanned_paths' not in st.session_state:
+        st.session_state.scanned_paths = set()
+    if 'pending_files' not in st.session_state:
+        st.session_state.pending_files = []  # List of FileInfo objects
+    if 'recent_folders' not in st.session_state:
+        st.session_state.recent_folders = load_recent_folders()
+    if 'current_browse_path' not in st.session_state:
+        st.session_state.current_browse_path = Path.home()
+    
+    # Sidebar for selection
+    with st.sidebar:
+        st.header("Select Source")
         
-        btn_choose = ttk.Button(btn_frame, text='Choose Folder…', command=self.on_choose_folder)
-        btn_choose.pack(side=tk.LEFT)
-
-        btn_choose_files = ttk.Button(btn_frame, text='Choose Files…', command=self.on_choose_files)
-        btn_choose_files.pack(side=tk.LEFT, padx=(5, 0))
-
-        self.btn_scan = ttk.Button(btn_frame, text='Scan All', command=self.on_scan, state=tk.DISABLED)
-        self.btn_scan.pack(side=tk.LEFT, padx=(10, 0))
-
-        self.btn_export = ttk.Button(btn_frame, text='Export CSV', command=self.on_export, state=tk.DISABLED)
-        self.btn_export.pack(side=tk.LEFT, padx=(10, 0))
-
-        self.btn_logs = ttk.Button(btn_frame, text='Open Logs…', command=self.on_open_logs)
-        self.btn_logs.pack(side=tk.RIGHT)
-
-        # Create frame for tree and scrollbars
-        tree_frame = ttk.Frame(self)
-        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        # Create tabs for different selection methods
+        tab1, tab2, tab3 = st.tabs(["📁 Browse", "📋 Paste", "⬆️ Upload"])
         
-        cols = ('action', 'archive', 'parts', 'service', 'files', 'photos', 'videos', 'json', 'other', 'size')
-        self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings')
-        for key, title, width, minwidth, anchor, stretch in (
-            ('action','Action',70,70,tk.CENTER,False),
-            ('archive','Source',250,150,tk.W,True),
-            ('parts','Group/Name',150,100,tk.W,True),
-            ('service','Service',100,80,tk.W,False),
-            ('files','Files',60,50,tk.E,False),
-            ('photos','Photos',60,50,tk.E,False),
-            ('videos','Videos',60,50,tk.E,False),
-            ('json','JSON',60,50,tk.E,False),
-            ('other','Other',60,50,tk.E,False),
-            ('size','Size',100,80,tk.E,False),
-        ):
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, minwidth=minwidth, anchor=anchor, stretch=stretch)
-
-        # Bind click event to handle scan button clicks
-        self.tree.bind('<Button-1>', self._on_tree_click)
-
-        # Vertical scrollbar
-        vsb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        
-        # Horizontal scrollbar
-        hsb = ttk.Scrollbar(tree_frame, orient='horizontal', command=self.tree.xview)
-        self.tree.configure(xscrollcommand=hsb.set)
-        
-        # Grid layout for tree and scrollbars
-        self.tree.grid(row=0, column=0, sticky='nsew')
-        vsb.grid(row=0, column=1, sticky='ns')
-        hsb.grid(row=1, column=0, sticky='ew')
-        
-        tree_frame.grid_rowconfigure(0, weight=1)
-        tree_frame.grid_columnconfigure(0, weight=1)
-
-        # Progress area
-        prog = ttk.Frame(self, padding=(10, 0))
-        prog.pack(side=tk.TOP, fill=tk.X)
-        self.overall_label_var = tk.StringVar(value='Overall: 0/0')
-        ttk.Label(prog, textvariable=self.overall_label_var).pack(anchor=tk.W)
-        self.pb_overall = ttk.Progressbar(prog, mode='determinate', maximum=1, value=0)
-        self.pb_overall.pack(fill=tk.X, pady=(2, 8))
-
-        self.current_label_var = tk.StringVar(value='Current archive: —')
-        ttk.Label(prog, textvariable=self.current_label_var).pack(anchor=tk.W)
-        self.pb_current = ttk.Progressbar(prog, mode='determinate', maximum=1, value=0)
-        self.pb_current.pack(fill=tk.X, pady=(2, 8))
-
-        self.btn_cancel = ttk.Button(prog, text='Cancel Scan', command=self.on_cancel, state=tk.DISABLED)
-        self.btn_cancel.pack(anchor=tk.E)
-
-        self.status_var = tk.StringVar(value='Ready')
-        status = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, padding=(8, 4))
-        status.pack(side=tk.BOTTOM, fill=tk.X)
-
-    # Handlers
-    def on_choose_folder(self) -> None:
-        """Let user select a folder."""
-        chosen = filedialog.askdirectory(title='Select folder with Google Takeout archives or data')
-        if not chosen:
-            return
-        
-        # User selected a folder
-        self._root_dir = Path(chosen)
-        self._selected_files = None
-        self.dir_var.set(str(self._root_dir))
-        self.btn_scan.config(state=tk.NORMAL)
-        
-        # Immediately show the selected folder in the table
-        self._show_selected_folder()
-        
-        self.status('Folder selected. Click "Scan" to analyze contents.')
-        logger.info(f"Chosen folder: {self._root_dir}")
-
-    def on_choose_files(self) -> None:
-        """Let user select individual archive files."""
-        files = filedialog.askopenfilenames(
-            title='Select Google Takeout archive files',
-            filetypes=[
-                ('Archive files', '*.zip *.tgz *.tar.gz'),
-                ('ZIP files', '*.zip'),
-                ('TGZ files', '*.tgz *.tar.gz'),
-                ('All files', '*.*')
-            ]
-        )
-        if not files:
-            return
-        
-        # If they selected files, use the parent directory as root
-        # and we'll scan those specific files
-        self._root_dir = Path(files[0]).parent
-        self._selected_files = [Path(f) for f in files]
-        self.dir_var.set(f"{len(files)} file(s) selected: {self._root_dir}")
-        self.btn_scan.config(state=tk.NORMAL)
-        self._show_selected_files()
-        self.status(f'{len(files)} file(s) selected. Click "Scan All" or individual [Scan] buttons.')
-        logger.info(f"Chosen files: {files}")
-
-    def _show_selected_folder(self) -> None:
-        """Display the selected folder immediately in the table."""
-        if not self._root_dir:
-            return
-        
-        # Clear existing rows
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        
-        # Show the selected folder as pending scan
-        self.tree.insert('', tk.END, values=(
-            '[Scan]',
-            str(self._root_dir.name),
-            '(pending scan)',
-            '(pending scan)',
-            '—',
-            '—',
-            '—',
-            '—',
-            '—',
-            '—',
-        ), tags=('scannable',))
-
-    def _show_selected_files(self) -> None:
-        """Display the selected files immediately in the table."""
-        if not self._selected_files:
-            return
-        
-        # Clear existing rows
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        
-        # Show each selected file as pending scan
-        for file_path in self._selected_files:
-            self.tree.insert('', tk.END, values=(
-                '[Scan]',
-                str(file_path.name),
-                '(pending scan)',
-                '(pending scan)',
-                '—',
-                '—',
-                '—',
-                '—',
-                '—',
-                '—',
-            ), tags=('scannable',))
-
-    def _on_tree_click(self, event) -> None:
-        """Handle clicks on the tree, specifically on the Action column."""
-        region = self.tree.identify_region(event.x, event.y)
-        if region == 'cell':
-            column = self.tree.identify_column(event.x)
-            row = self.tree.identify_row(event.y)
+        with tab1:
+            st.markdown("**Browse for folder:**")
             
-            # Check if clicked on Action column (column #0 is the first column)
-            if column == '#1' and row:  # #1 is the 'action' column
-                # Check if this row has a scan button
-                values = self.tree.item(row, 'values')
-                if values and values[0] == '[Scan]':
-                    # Trigger scan for this specific item
-                    self._scan_single_item(row)
-
-    def _scan_single_item(self, item_id: str) -> None:
-        """Scan a single item from the tree."""
-        values = self.tree.item(item_id, 'values')
-        if not values:
-            return
-        
-        # Get the path from the row (second column is the source)
-        source_name = values[1]
-        
-        # Find the actual path
-        target_path = None
-        
-        # Check if we have selected files
-        if self._selected_files:
-            for file_path in self._selected_files:
-                if file_path.name == source_name:
-                    target_path = file_path
-                    break
-        
-        # Otherwise check root directory
-        if not target_path:
-            if self._root_dir and self._root_dir.name == source_name:
-                target_path = self._root_dir
-            elif self._root_dir:
-                potential = self._root_dir / source_name
-                if potential.exists():
-                    target_path = potential
-        
-        if not target_path:
-            self.status('Could not find item to scan.')
-            return
-        
-        # Update the row to show scanning
-        self.tree.item(item_id, values=(
-            '[...]',
-            values[1],
-            '(scanning...)',
-            values[3],
-            '—',
-            '—',
-            '—',
-            '—',
-            '—',
-            '—',
-        ))
-        
-        # Launch scan in background thread
-        threading.Thread(target=self._scan_single_item_thread, args=(item_id, target_path), daemon=True).start()
-
-    def _scan_single_item_thread(self, item_id: str, path: Path) -> None:
-        """Background thread to scan a single item."""
-        try:
-            if path.is_file():
-                # It's an archive
-                summary = scan_archive(path)
-            else:
-                # It's a directory
-                summary = scan_directory(path)
-            
-            # Update the tree with results
-            def update():
-                self.tree.item(item_id, values=(
-                    '[✓]',  # Checkmark to show it's been scanned
-                    Path(summary.path).name,
-                    summary.parts_group if summary.parts_group != Path(summary.path).name else '—',
-                    summary.service_guess,
-                    summary.file_count,
-                    summary.photos,
-                    summary.videos,
-                    summary.json_sidecars,
-                    summary.other,
-                    human_size(summary.compressed_size),
-                ))
-                self.status(f'Scanned: {Path(summary.path).name}')
-            
-            self._ui(update)
-            
-        except Exception as e:
-            logger.exception(f"Failed to scan {path}: {e}")
-            def error_update():
-                values = self.tree.item(item_id, 'values')
-                self.tree.item(item_id, values=(
-                    '[X]',
-                    values[1] if values else str(path.name),
-                    '(error)',
-                    str(e)[:50],
-                    '—',
-                    '—',
-                    '—',
-                    '—',
-                    '—',
-                    '—',
-                ))
-                self.status(f'Error scanning: {path.name}')
-            self._ui(error_update)
-
-    def on_scan(self) -> None:
-        if not self._root_dir:
-            return
-        self.btn_scan.config(state=tk.DISABLED)
-        self.btn_export.config(state=tk.DISABLED)
-        self.btn_cancel.config(state=tk.NORMAL)
-        self._cancel_evt.clear()
-        self.status('Scanning…')
-        self._prev_index = load_index()
-        self._set_overall_progress(0, 1)
-        self._set_current_label('Current archive: —')
-        threading.Thread(target=self._scan_thread, daemon=True).start()
-
-    def _scan_thread(self) -> None:
-        start = time.time()
-        try:
-            # If specific files were selected, scan only those
-            if self._selected_files:
-                archives = [f for f in self._selected_files if f.is_file()]
-                directories = [f for f in self._selected_files if f.is_dir()]
-                total = len(archives) + len(directories)
-                logger.info(f"Scanning {len(archives)} selected archive(s) and {len(directories)} selected directory(ies).")
-            else:
-                # Otherwise scan everything in the root directory
-                archives, directories = find_archives_and_dirs(self._root_dir or Path('.'))
-                total = len(archives) + len(directories)
-                logger.info(f"Found {len(archives)} archive(s) and {len(directories)} directory(ies).")
-            
-            if total == 0:
-                # No Takeout content found - show the folder with appropriate label
-                self._show_no_takeout_found()
-                self._set_status('No Takeout content found in the selected folder.')
-                self._enable_scan_buttons()
-                return
-            
-            rows: List[ArchiveSummary] = []
-            current_index: Dict[str, Dict[str, float]] = {}
-            self._set_overall_progress(0, max(1, total))
-            
-            # Scan directories first
-            item_count = 0
-            for i, d in enumerate(directories, 1):
-                if self._cancel_evt.is_set():
-                    logger.info('Scan canceled by user.')
-                    break
-                item_count += 1
-                self._set_current_label(f'Current directory: {d.name} ({item_count}/{total})')
-                self._current_progress_start(0)  # Indeterminate for directories
-                
-                r = scan_directory(d)
-                rows.append(r)
-                
-                try:
-                    st = d.stat()
-                    current_index[str(d.resolve())] = {'size': float(r.compressed_size), 'mtime': float(st.st_mtime)}
-                except Exception:
-                    pass
-                
-                # Update overall progress and ETA
-                self._set_overall_progress(item_count, max(1, total))
-                elapsed = time.time() - start
-                rate = item_count / elapsed if elapsed > 0 else 0
-                remaining = (total - item_count) / rate if rate > 0 else 0
-                eta = time.strftime('%M:%S', time.gmtime(max(0, int(remaining))))
-                self._set_status(f'Scanned {item_count}/{total} items • ETA ~ {eta}')
-            
-            # Then scan archives
-            for i, a in enumerate(archives, 1):
-                if self._cancel_evt.is_set():
-                    logger.info('Scan canceled by user.')
-                    break
-                item_count += 1
-                self._set_current_label(f'Current archive: {a.name} ({item_count}/{total})')
-                # Per-archive progress
-                members = iter_members_with_progress(a, self._current_progress_start, self._current_progress_tick)
-                # Build summary from members
-                try:
-                    size_bytes = a.stat().st_size
-                except Exception:
-                    size_bytes = 0
-                photos, videos, jsons, other = tally_exts(members)
-                svc = guess_service_from_members(members)
-                r = ArchiveSummary(
-                    path=str(a),
-                    parts_group=derive_parts_group(a),
-                    service_guess=svc,
-                    file_count=len(members),
-                    photos=photos,
-                    videos=videos,
-                    json_sidecars=jsons,
-                    other=other,
-                    compressed_size=size_bytes,
+            # Recent folders quick access
+            if st.session_state.recent_folders:
+                recent_folder = st.selectbox(
+                    "Recent folders:",
+                    options=['-- Select recent --'] + st.session_state.recent_folders,
+                    key='recent_select'
                 )
-                rows.append(r)
-                try:
-                    st = a.stat()
-                    current_index[str(a.resolve())] = {'size': float(st.st_size), 'mtime': float(st.st_mtime)}
-                except Exception:
-                    pass
-                # Update overall progress and ETA
-                self._set_overall_progress(item_count, max(1, total))
-                elapsed = time.time() - start
-                rate = item_count / elapsed if elapsed > 0 else 0
-                remaining = (total - item_count) / rate if rate > 0 else 0
-                eta = time.strftime('%M:%S', time.gmtime(max(0, int(remaining))))
-                self._set_status(f'Scanned {item_count}/{total} items • ETA ~ {eta}')
-            # Diff and persist index
-            prev_paths = set(self._prev_index.keys())
-            curr_paths = set(current_index.keys())
-            self._new_paths = curr_paths - prev_paths
-            self._missing_paths = prev_paths - curr_paths
-            save_index(current_index)
-            self._rows = rows
-            self._populate_tree()
-            if self._new_paths or self._missing_paths:
-                added = '\n'.join(Path(p).name for p in sorted(self._new_paths)) or '(none)'
-                missing = '\n'.join(Path(p).name for p in sorted(self._missing_paths)) or '(none)'
-                message = (
-                    f"New archives: {len(self._new_paths)}\n{added}\n\n"
-                    f"Missing since last scan: {len(self._missing_paths)}\n{missing}"
-                )
-                self._info_dialog('Changes since last scan', message)
-            final_msg = 'Scan canceled.' if self._cancel_evt.is_set() else f'Scan complete. {len(rows)} archive(s) summarized.'
-            self._set_status(final_msg)
-            self._enable_export(len(rows) > 0)
-        except Exception as e:
-            logger.exception(f"Scan failed: {e}")
-            self._error_dialog('Error', f'Scan failed: {e}')
-        finally:
-            self._enable_scan_buttons()
-            self._stop_current_spinner()
-
-    def _show_no_takeout_found(self) -> None:
-        """Display the folder when no Takeout content is found."""
-        if not self._root_dir:
-            return
-        
-        # Quick scan to get basic file stats
-        try:
-            file_count = 0
-            total_size = 0
-            for root, _dirs, files in os.walk(self._root_dir):
-                file_count += len(files)
-                for f in files:
-                    try:
-                        total_size += (Path(root) / f).stat().st_size
-                    except Exception:
-                        pass
+                if recent_folder != '-- Select recent --':
+                    st.session_state.current_browse_path = Path(recent_folder)
             
-            # Create a summary row
-            summary = ArchiveSummary(
-                path=str(self._root_dir),
-                parts_group=self._root_dir.name,
-                service_guess='(no Takeout found)',
-                file_count=file_count,
-                photos=0,
-                videos=0,
-                json_sidecars=0,
-                other=file_count,
-                compressed_size=total_size,
+            # Manual path entry with current path display
+            folder_path = st.text_input(
+                "Folder Path",
+                value=str(st.session_state.current_browse_path),
+                placeholder="Enter or edit folder path",
+                help="Type or paste a folder path"
             )
-            self._rows = [summary]
-            self._populate_tree()
-        except Exception as e:
-            logger.exception(f"Failed to scan folder: {e}")
-            # Just show basic info
-            for item in self.tree.get_children():
-                self.tree.delete(item)
-            self.tree.insert('', tk.END, values=(
-                '[✓]',
-                str(self._root_dir.name),
-                self._root_dir.name,
-                '(no Takeout found)',
-                '—',
-                '—',
-                '—',
-                '—',
-                '—',
-                '—',
-            ))
-
-    def _populate_tree(self) -> None:
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        # Summaries by parts group (for visual cue of multi-part exports)
-        parts_counter: Dict[str, int] = Counter(r.parts_group for r in self._rows)
-        new_basenames = {Path(p).name for p in self._new_paths}
-        for r in self._rows:
-            part_suffix = ''
-            if parts_counter[r.parts_group] > 1:
-                part_suffix = f' ({parts_counter[r.parts_group]} files)'
-            self.tree.insert('', tk.END, values=(
-                '[✓]',  # Checkmark for already scanned
-                (lambda b: f"{b}  [NEW]" if b in new_basenames else b)(Path(r.path).name),
-                f'{r.parts_group}{part_suffix}',
-                r.service_guess,
-                r.file_count,
-                r.photos,
-                r.videos,
-                r.json_sidecars,
-                r.other,
-                human_size(r.compressed_size),
-            ))
-
-    def on_export(self) -> None:
-        if not self._rows:
-            return
-        ts = datetime.now().strftime('%Y%m%d-%H%M%S')
-        default_name = f'takeout_scout_summary_{ts}.csv'
-        dest = filedialog.asksaveasfilename(
-            title='Export summary to CSV',
-            defaultextension='.csv',
-            initialfile=default_name,
-            filetypes=[('CSV', '*.csv'), ('All files', '*.*')]
-        )
-        if not dest:
-            return
-        try:
-            with open(dest, 'w', newline='', encoding='utf-8') as f:
-                w = csv.writer(f)
-                w.writerow(['Archive','Parts Group','Service Guess','Files','Photos','Videos','JSON Sidecars','Other','Compressed Size (bytes)'])
-                for r in self._rows:
-                    w.writerow([
-                        Path(r.path).name,
-                        r.parts_group,
-                        r.service_guess,
-                        r.file_count,
-                        r.photos,
-                        r.videos,
-                        r.json_sidecars,
-                        r.other,
-                        r.compressed_size,
-                    ])
-            logger.info(f"Exported CSV: {dest}")
-            messagebox.showinfo('Export complete', f'CSV saved to:\n{dest}')
-        except Exception as e:
-            logger.exception(f"Export failed: {e}")
-            messagebox.showerror('Error', f'Export failed: {e}')
-
-    def on_open_logs(self) -> None:
-        try:
-            path = LOG_DIR / 'takeout_scout.log'
-            if not path.exists():
-                messagebox.showinfo('Logs', 'No log file yet. Run a scan first.')
-                return
-            if sys.platform.startswith('win'):
-                os.startfile(str(path))  # type: ignore
-            elif sys.platform == 'darwin':
-                os.system(f'open "{path}"')
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("📁 Load Folder", type="primary", use_container_width=True):
+                    if folder_path:
+                        cleaned_path = clean_file_path(folder_path)
+                        path_obj = Path(cleaned_path)
+                        if path_obj.exists() and path_obj.is_dir():
+                            add_recent_folder(str(path_obj))
+                            load_folder(path_obj)
+                        else:
+                            st.error("Invalid folder path")
+            
+            with col2:
+                # Parent directory navigation
+                if st.button("⬆️ Up", use_container_width=True):
+                    current = Path(folder_path) if folder_path else st.session_state.current_browse_path
+                    if current.parent != current:
+                        st.session_state.current_browse_path = current.parent
+                        st.rerun()
+            
+            # Browse current directory
+            if folder_path:
+                browse_path = Path(folder_path)
+                if browse_path.exists() and browse_path.is_dir():
+                    with st.expander("📂 Browse subfolders", expanded=False):
+                        try:
+                            subdirs = [d for d in browse_path.iterdir() if d.is_dir()]
+                            if subdirs:
+                                for subdir in sorted(subdirs)[:20]:  # Limit to 20
+                                    if st.button(f"📁 {subdir.name}", key=f"sub_{subdir}", use_container_width=True):
+                                        st.session_state.current_browse_path = subdir
+                                        st.rerun()
+                                if len(subdirs) > 20:
+                                    st.caption(f"... and {len(subdirs) - 20} more")
+                            else:
+                                st.caption("No subfolders")
+                        except PermissionError:
+                            st.warning("⚠️ Permission denied")
+        
+        with tab2:
+            st.markdown("**Paste paths manually:**")
+            
+            paste_mode = st.radio(
+                "Type:",
+                ["Folder", "Files"],
+                horizontal=True,
+                label_visibility="collapsed"
+            )
+            
+            if paste_mode == "Folder":
+                folder_path_paste = st.text_input(
+                    "Folder Path",
+                    placeholder="Paste folder path from file explorer",
+                    help="Right-click folder → Copy as path",
+                    key="paste_folder"
+                )
+                if folder_path_paste and st.button("📁 Load Pasted Folder", type="primary", use_container_width=True):
+                    cleaned_path = clean_file_path(folder_path_paste)
+                    path_obj = Path(cleaned_path)
+                    if path_obj.exists():
+                        add_recent_folder(str(path_obj))
+                    load_folder(path_obj)
             else:
-                os.system(f'xdg-open "{path}"')
+                st.info("💡 One path per line")
+                file_paths_text = st.text_area(
+                    "File Paths",
+                    placeholder="C:\\path\\to\\file1.zip\nC:\\path\\to\\file2.zip",
+                    height=150,
+                    help="Shift+Right-click files → Copy as path",
+                    key="paste_files"
+                )
+                if file_paths_text and st.button("📄 Load Pasted Files", type="primary", use_container_width=True):
+                    raw_paths = [line.strip() for line in file_paths_text.split('\n') if line.strip()]
+                    cleaned_paths = [clean_file_path(p) for p in raw_paths]
+                    load_files([Path(p) for p in cleaned_paths])
+        
+        with tab3:
+            st.markdown("**Upload archives:**")
+            st.info("⚠️ Large files may take time to upload")
+            
+            uploaded_files = st.file_uploader(
+                "Choose ZIP/TGZ files",
+                type=['zip', 'tgz', 'tar.gz'],
+                accept_multiple_files=True,
+                help="Select one or more archive files to upload and scan",
+                label_visibility="collapsed"
+            )
+            
+            if uploaded_files:
+                st.write(f"Selected: {len(uploaded_files)} file(s)")
+                if st.button("⬆️ Process Uploads", type="primary", use_container_width=True):
+                    process_uploaded_files(uploaded_files)
+        
+        st.divider()
+        
+        # Bulk actions
+        if st.session_state.pending_files:
+            st.subheader("Bulk Actions")
+            if st.button("🔍 Scan All Pending", type="primary", width="stretch"):
+                scan_all_pending()
+        
+        if st.session_state.results:
+            st.success(f"✅ {len(st.session_state.results)} items scanned")
+            
+            if st.button("🔄 Clear All", width="stretch"):
+                st.session_state.results = []
+                st.session_state.scanned_paths = set()
+                st.session_state.pending_files = []
+                st.rerun()
+            
+            if st.button("💾 Export CSV", width="stretch"):
+                export_csv()
+    
+    # Main area - Show pending files and results
+    if st.session_state.pending_files or st.session_state.results:
+        
+        # Pending files section
+        if st.session_state.pending_files:
+            st.subheader("📋 Files Ready to Scan")
+            display_file_cards()
+            st.divider()
+        
+        # Scanned results section
+        if st.session_state.results:
+            st.subheader("✅ Scan Results")
+            display_results_table()
+    
+    else:
+        show_welcome_screen()
+
+
+# --- UI Display Functions ----------------------------------------------------
+def display_file_cards():
+    """Display beautiful cards for each pending file."""
+    for idx, file_info in enumerate(st.session_state.pending_files):
+        with st.container():
+            # Create a nice border using columns
+            col1, col2, col3 = st.columns([3, 2, 1])
+            
+            with col1:
+                # File name and type
+                icon = get_file_icon(file_info)
+                st.markdown(f"### {icon} {file_info.name}")
+                st.caption(f"`{file_info.path.parent}`")
+            
+            with col2:
+                # Status and size info
+                status_color = get_status_color(file_info.status)
+                status_text = get_status_text(file_info)
+                st.markdown(f"**Status:** :{status_color}[{status_text}]")
+                st.markdown(f"**Size:** {human_size(file_info.size)}")
+                st.markdown(f"**Type:** {file_info.file_type or 'Unknown'}")
+            
+            with col3:
+                # Scan button
+                if file_info.is_valid and file_info.status != FileStatus.SCANNED:
+                    if st.button(f"🔍 Scan", key=f"scan_{idx}", type="primary"):
+                        scan_single_file(idx)
+                elif not file_info.is_valid:
+                    st.error("❌ Invalid")
+                else:
+                    st.success("✅ Done")
+            
+            # Error message if any
+            if file_info.error_message:
+                st.error(f"⚠️ {file_info.error_message}")
+            
+            st.divider()
+
+
+def display_results_table():
+    """Display the scanned results in a table."""
+    df = pd.DataFrame([r.to_dict() for r in st.session_state.results])
+    
+    # Display interactive table
+    st.dataframe(
+        df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Path": st.column_config.TextColumn("Path", width="large"),
+            "Service": st.column_config.TextColumn("Service", width="medium"),
+            "Size": st.column_config.TextColumn("Size", width="small"),
+        }
+    )
+    
+    # Summary stats
+    col1, col2, col3, col4, col5 = st.columns(5)
+    total_files = sum(r.file_count for r in st.session_state.results)
+    total_photos = sum(r.photos for r in st.session_state.results)
+    total_videos = sum(r.videos for r in st.session_state.results)
+    total_json = sum(r.json_sidecars for r in st.session_state.results)
+    total_size = sum(r.compressed_size for r in st.session_state.results)
+    
+    col1.metric("Total Files", f"{total_files:,}")
+    col2.metric("Photos", f"{total_photos:,}")
+    col3.metric("Videos", f"{total_videos:,}")
+    col4.metric("JSON", f"{total_json:,}")
+    col5.metric("Total Size", human_size(total_size))
+
+
+def show_welcome_screen():
+    """Show welcome screen when no files are loaded."""
+    st.info("👈 Select a folder or files from the sidebar to begin")
+    
+    with st.expander("ℹ️ How to use"):
+        st.markdown("""
+        **Folder Mode:**
+        1. Copy a folder path from File Explorer
+        2. Paste it in the 'Folder Path' box
+        3. Click 'Load Folder' to validate files
+        4. Click individual 'Scan' buttons or 'Scan All Pending'
+        
+        **Files Mode:**
+        1. Select files in File Explorer
+        2. Shift+Right-Click and choose 'Copy as path'
+        3. Paste into the 'File Paths' box
+        4. Click 'Load Files' to validate
+        5. Click individual 'Scan' buttons or 'Scan All Pending'
+        
+        **Features:**
+        - Instant file validation
+        - Non-destructive scanning (files are never modified)
+        - Detects Google Photos, Drive, Maps, and more
+        - Supports ZIP and TGZ archives
+        - Scans uncompressed Takeout folders
+        - Export results to CSV
+        """)
+
+
+def get_file_icon(file_info: FileInfo) -> str:
+    """Get an appropriate icon for the file type."""
+    if file_info.file_type == 'zip':
+        return '📦'
+    elif file_info.file_type == 'tgz':
+        return '📚'
+    elif file_info.file_type == 'directory':
+        return '📁'
+    else:
+        return '📄'
+
+
+def get_status_color(status: FileStatus) -> str:
+    """Get color for status badge."""
+    if status == FileStatus.VALID:
+        return 'green'
+    elif status == FileStatus.INVALID:
+        return 'red'
+    elif status == FileStatus.SCANNING:
+        return 'orange'
+    elif status == FileStatus.SCANNED:
+        return 'blue'
+    elif status == FileStatus.ERROR:
+        return 'red'
+    else:
+        return 'gray'
+
+
+def get_status_text(file_info: FileInfo) -> str:
+    """Get human-readable status text."""
+    if file_info.status == FileStatus.VALID:
+        return "Valid & Ready"
+    elif file_info.status == FileStatus.INVALID:
+        return "Invalid File"
+    elif file_info.status == FileStatus.SCANNING:
+        return "Scanning..."
+    elif file_info.status == FileStatus.SCANNED:
+        return "Scanned"
+    elif file_info.status == FileStatus.ERROR:
+        return "Error"
+    else:
+        return "Pending"
+
+
+# --- File Loading Functions --------------------------------------------------
+def clean_file_path(path_str: str) -> str:
+    """Clean up a file path string from various sources."""
+    # Remove quotes that Windows adds when you copy as path
+    path_str = path_str.strip()
+    if path_str.startswith('"') and path_str.endswith('"'):
+        path_str = path_str[1:-1]
+    # Also handle single quotes
+    if path_str.startswith("'") and path_str.endswith("'"):
+        path_str = path_str[1:-1]
+    return path_str.strip()
+
+
+def load_folder(folder_path: Path):
+    """Load and validate files from a folder."""
+    if not folder_path.exists():
+        st.error(f"❌ Folder not found: `{folder_path}`")
+        st.caption(f"Resolved path: `{folder_path.resolve()}`")
+        return
+    
+    progress_bar = st.progress(0, text=f"Searching {folder_path.name}...")
+    status_text = st.empty()
+    
+    def update_search_progress(message: str, progress: float):
+        progress_bar.progress(progress, text=message)
+        status_text.text(message)
+    
+    archives, directories = find_archives_and_dirs(folder_path, progress_callback=update_search_progress)
+    all_items = list(archives) + list(directories)
+    
+    if not all_items:
+        progress_bar.empty()
+        status_text.empty()
+        st.warning(f"⚠️ No archives or Takeout directories found in {folder_path}")
+        # Still validate the folder itself
+        file_info = validate_and_get_info(folder_path)
+        st.session_state.pending_files.append(file_info)
+        st.rerun()
+        return
+    
+    # Validate all found files
+    status_text.text(f"Found {len(all_items)} items, validating...")
+    progress_bar.progress(0, text=f"Validating 0/{len(all_items)} files...")
+    for i, item in enumerate(all_items, 1):
+        file_info = validate_and_get_info(item)
+        st.session_state.pending_files.append(file_info)
+        progress_bar.progress(i / len(all_items), text=f"Validating {i}/{len(all_items)} files...")
+    
+    progress_bar.empty()
+    status_text.empty()
+    st.success(f"✅ Loaded {len(all_items)} files")
+    st.rerun()
+
+
+def load_files(file_paths: List[Path]):
+    """Load and validate individual files."""
+    if not file_paths:
+        st.warning("⚠️ No file paths provided")
+        return
+    
+    valid_count = 0
+    
+    with st.spinner(f"Validating {len(file_paths)} file(s)..."):
+        progress_bar = st.progress(0, text=f"Validating 0/{len(file_paths)} files...")
+        
+        for i, file_path in enumerate(file_paths, 1):
+            # Debug: show what path we're trying to validate
+            logger.info(f"Validating path: {file_path} (exists: {file_path.exists()})")
+            
+            file_info = validate_and_get_info(file_path)
+            st.session_state.pending_files.append(file_info)
+            if file_info.is_valid:
+                valid_count += 1
+            progress_bar.progress(i / len(file_paths), text=f"Validating {i}/{len(file_paths)} files...")
+        
+        progress_bar.empty()
+        
+        if valid_count == 0:
+            st.error(f"❌ No valid files found")
+            # Show the first error for debugging
+            if st.session_state.pending_files:
+                first = st.session_state.pending_files[-len(file_paths)]
+                if first.error_message:
+                    st.caption(f"First error: {first.error_message}")
+                st.caption(f"Path tried: `{first.path}`")
+        elif valid_count < len(file_paths):
+            st.warning(f"⚠️ Loaded {valid_count}/{len(file_paths)} valid files")
+        else:
+            st.success(f"✅ All {valid_count} files are valid")
+        
+        st.rerun()
+
+
+def scan_single_file(index: int):
+    """Scan a single file from the pending list."""
+    file_info = st.session_state.pending_files[index]
+    
+    # Create progress tracking
+    progress_bar = st.progress(0, text=f"Initializing scan of {file_info.name}...")
+    status_text = st.empty()
+    
+    def update_progress(message: str, progress: float):
+        progress_bar.progress(progress, text=message)
+        status_text.text(message)
+    
+    try:
+        if file_info.file_type == 'directory':
+            summary = scan_directory(file_info.path, progress_callback=update_progress)
+        else:
+            summary = scan_archive(file_info.path, progress_callback=update_progress)
+        
+        st.session_state.results.append(summary)
+        st.session_state.scanned_paths.add(str(file_info.path))
+        
+        # Update status
+        file_info.status = FileStatus.SCANNED
+        st.session_state.pending_files[index] = file_info
+        
+        progress_bar.empty()
+        status_text.empty()
+        st.success(f"✅ Scanned {file_info.name}")
+        st.rerun()
+            
         except Exception as e:
-            logger.exception(f"Open logs failed: {e}")
-            messagebox.showerror('Error', f'Open logs failed: {e}')
+            logger.exception(f"Failed to scan {file_info.path}: {e}")
+            file_info.status = FileStatus.ERROR
+            file_info.error_message = str(e)
+            st.session_state.pending_files[index] = file_info
+            st.error(f"❌ Error scanning {file_info.name}: {e}")
 
-    def status(self, text: str) -> None:
-        # legacy; prefer _set_status from worker thread
-        self.status_var.set(text)
-        self.update_idletasks()
 
-    # --- UI thread-safe helpers ---
-    def _ui(self, fn) -> None:
+def scan_all_pending():
+    """Scan all pending valid files."""
+    valid_files = [
+        (i, f) for i, f in enumerate(st.session_state.pending_files)
+        if f.is_valid and f.status != FileStatus.SCANNED
+    ]
+    
+    if not valid_files:
+        st.warning("No files to scan")
+        return
+    
+    progress_bar = st.progress(0, text=f"Scanning 0/{len(valid_files)} files...")
+    detail_text = st.empty()
+    
+    for count, (index, file_info) in enumerate(valid_files, 1):
+        base_progress = (count - 1) / len(valid_files)
+        progress_increment = 1.0 / len(valid_files)
+        
+        def update_progress(message: str, sub_progress: float):
+            overall_progress = base_progress + (sub_progress * progress_increment)
+            progress_bar.progress(
+                overall_progress,
+                text=f"[{count}/{len(valid_files)}] {file_info.name}"
+            )
+            detail_text.text(message)
+        
         try:
-            self.after(0, fn)
-        except Exception:
-            pass
+            if file_info.file_type == 'directory':
+                summary = scan_directory(file_info.path, progress_callback=update_progress)
+            else:
+                summary = scan_archive(file_info.path, progress_callback=update_progress)
+            
+            st.session_state.results.append(summary)
+            st.session_state.scanned_paths.add(str(file_info.path))
+            file_info.status = FileStatus.SCANNED
+            st.session_state.pending_files[index] = file_info
+            
+        except Exception as e:
+            logger.exception(f"Failed to scan {file_info.path}: {e}")
+            file_info.status = FileStatus.ERROR
+            file_info.error_message = str(e)
+            st.session_state.pending_files[index] = file_info
+        
+        progress_bar.progress(count / len(valid_files), text=f"Completed {count}/{len(valid_files)} files")
+    
+    progress_bar.empty()
+    detail_text.empty()
+    st.success(f"✅ Scanned {len(valid_files)} files")
+    st.rerun()
 
-    def _set_status(self, text: str) -> None:
-        self._ui(lambda: self.status_var.set(text))
 
-    def _set_overall_progress(self, value: int, maximum: int) -> None:
-        def _apply():
-            self.overall_label_var.set(f'Overall: {value}/{maximum}')
-            self.pb_overall.config(maximum=maximum, value=value)
-        self._ui(_apply)
+def process_folder(folder_path: Path):
+    """Process a folder by finding and scanning all archives/directories."""
+    if not folder_path.exists():
+        st.error(f"❌ Folder not found: {folder_path}")
+        return
+    
+    with st.spinner(f"Scanning {folder_path.name}..."):
+        archives, directories = find_archives_and_dirs(folder_path)
+        total = len(archives) + len(directories)
+        
+        if total == 0:
+            st.warning(f"⚠️ No Takeout archives or directories found in {folder_path}")
+            # Still show the folder with basic stats
+            summary = scan_directory(folder_path)
+            if summary.file_count > 0:
+                st.session_state.results.append(summary)
+                st.session_state.scanned_paths.add(str(folder_path))
+            return
+        
+        progress_bar = st.progress(0, text=f"Scanning 0/{total} items...")
+        
+        count = 0
+        for directory in directories:
+            if str(directory) not in st.session_state.scanned_paths:
+                summary = scan_directory(directory)
+                st.session_state.results.append(summary)
+                st.session_state.scanned_paths.add(str(directory))
+            count += 1
+            progress_bar.progress(count / total, text=f"Scanning {count}/{total} items...")
+        
+        for archive in archives:
+            if str(archive) not in st.session_state.scanned_paths:
+                summary = scan_archive(archive)
+                st.session_state.results.append(summary)
+                st.session_state.scanned_paths.add(str(archive))
+            count += 1
+            progress_bar.progress(count / total, text=f"Scanning {count}/{total} items...")
+        
+        progress_bar.empty()
+        st.success(f"✅ Scanned {total} items from {folder_path.name}")
+        st.rerun()
 
-    def _start_current_spinner(self) -> None:
-        # no-op (spinner replaced with determinate progress)
+
+def process_files(file_paths: List[Path]):
+    """Process a list of specific files."""
+    valid_files = [f for f in file_paths if f.exists()]
+    
+    if not valid_files:
+        st.error("❌ No valid files found")
+        return
+    
+    invalid = len(file_paths) - len(valid_files)
+    if invalid > 0:
+        st.warning(f"⚠️ Skipped {invalid} invalid path(s)")
+    
+    with st.spinner(f"Scanning {len(valid_files)} file(s)..."):
+        progress_bar = st.progress(0, text=f"Scanning 0/{len(valid_files)} files...")
+        
+        for i, file_path in enumerate(valid_files, 1):
+            if str(file_path) not in st.session_state.scanned_paths:
+                if file_path.is_file():
+                    summary = scan_archive(file_path)
+                else:
+                    summary = scan_directory(file_path)
+                st.session_state.results.append(summary)
+                st.session_state.scanned_paths.add(str(file_path))
+            
+            progress_bar.progress(i / len(valid_files), text=f"Scanning {i}/{len(valid_files)} files...")
+        
+        progress_bar.empty()
+        st.success(f"✅ Scanned {len(valid_files)} file(s)")
+        st.rerun()
+
+
+def process_uploaded_files(uploaded_files):
+    """Process files uploaded through Streamlit's file uploader."""
+    import tempfile
+    import shutil
+    
+    if not uploaded_files:
+        return
+    
+    # Create temp directory for uploads
+    temp_dir = Path(tempfile.mkdtemp(prefix='takeout_scout_'))
+    
+    try:
+        with st.spinner(f"Processing {len(uploaded_files)} uploaded file(s)..."):
+            file_paths = []
+            
+            for uploaded_file in uploaded_files:
+                # Save uploaded file to temp location
+                temp_path = temp_dir / uploaded_file.name
+                with open(temp_path, 'wb') as f:
+                    f.write(uploaded_file.getbuffer())
+                file_paths.append(temp_path)
+                logger.info(f"Saved upload: {uploaded_file.name} ({human_size(uploaded_file.size)})")
+            
+            # Now scan them
+            load_files(file_paths)
+            st.success(f"✅ Uploaded and loaded {len(file_paths)} file(s)")
+            
+    except Exception as e:
+        logger.exception(f"Error processing uploads: {e}")
+        st.error(f"❌ Error processing uploads: {e}")
+    finally:
+        # Cleanup temp directory after a delay (files might still be in use)
+        # Note: In production, you might want a better cleanup strategy
         pass
 
-    def _stop_current_spinner(self) -> None:
-        # no-op (spinner replaced with determinate progress)
-        pass
 
-    def _current_progress_start(self, total: int) -> None:
-        def _apply():
-            self.pb_current.config(mode='determinate', maximum=max(1, total), value=0)
-        self._ui(_apply)
-
-    def _current_progress_tick(self) -> None:
-        self._ui(lambda: self.pb_current.step(1))
-
-    def _set_current_label(self, text: str) -> None:
-        self._ui(lambda: self.current_label_var.set(text))
-
-    def _enable_export(self, enable: bool) -> None:
-        self._ui(lambda: self.btn_export.config(state=tk.NORMAL if enable else tk.DISABLED))
-
-    def _enable_scan_buttons(self) -> None:
-        def _apply():
-            self.btn_scan.config(state=tk.NORMAL)
-            self.btn_cancel.config(state=tk.DISABLED)
-        self._ui(_apply)
-
-    def _info_dialog(self, title: str, message: str) -> None:
-        self._ui(lambda: messagebox.showinfo(title, message))
-
-    def _error_dialog(self, title: str, message: str) -> None:
-        self._ui(lambda: messagebox.showerror(title, message))
-
-    def on_cancel(self) -> None:
-        self._cancel_evt.set()
-        self._set_status('Canceling…')
-
-
-def main() -> None:
-    logger.info('Takeout Scout started.')
-    app = TakeoutScoutGUI()
-    app.mainloop()
+def export_csv():
+    """Export results to CSV."""
+    if not st.session_state.results:
+        st.warning("No results to export")
+        return
+    
+    df = pd.DataFrame([r.to_dict() for r in st.session_state.results])
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    filename = f'takeout_scout_summary_{timestamp}.csv'
+    
+    csv = df.to_csv(index=False)
+    st.sidebar.download_button(
+        label="⬇️ Download CSV",
+        data=csv,
+        file_name=filename,
+        mime='text/csv',
+        type="primary"
+    )
 
 
 if __name__ == '__main__':
