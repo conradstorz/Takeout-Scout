@@ -851,7 +851,7 @@ def main():
             
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("📁 Load Folder", type="primary", use_container_width=True):
+                if st.button("📁 Load Folder", type="primary", width="stretch"):
                     if folder_path:
                         cleaned_path = clean_file_path(folder_path)
                         path_obj = Path(cleaned_path)
@@ -863,7 +863,7 @@ def main():
             
             with col2:
                 # Parent directory navigation
-                if st.button("⬆️ Up", use_container_width=True):
+                if st.button("⬆️ Up", width="stretch"):
                     current = Path(folder_path) if folder_path else st.session_state.current_browse_path
                     if current.parent != current:
                         st.session_state.current_browse_path = current.parent
@@ -878,7 +878,7 @@ def main():
                             subdirs = [d for d in browse_path.iterdir() if d.is_dir()]
                             if subdirs:
                                 for subdir in sorted(subdirs)[:20]:  # Limit to 20
-                                    if st.button(f"📁 {subdir.name}", key=f"sub_{subdir}", use_container_width=True):
+                                    if st.button(f"📁 {subdir.name}", key=f"sub_{subdir}", width="stretch"):
                                         st.session_state.current_browse_path = subdir
                                         st.rerun()
                                 if len(subdirs) > 20:
@@ -905,7 +905,7 @@ def main():
                     help="Right-click folder → Copy as path",
                     key="paste_folder"
                 )
-                if folder_path_paste and st.button("📁 Load Pasted Folder", type="primary", use_container_width=True):
+                if folder_path_paste and st.button("📁 Load Pasted Folder", type="primary", width="stretch"):
                     cleaned_path = clean_file_path(folder_path_paste)
                     path_obj = Path(cleaned_path)
                     if path_obj.exists():
@@ -920,7 +920,7 @@ def main():
                     help="Shift+Right-click files → Copy as path",
                     key="paste_files"
                 )
-                if file_paths_text and st.button("📄 Load Pasted Files", type="primary", use_container_width=True):
+                if file_paths_text and st.button("📄 Load Pasted Files", type="primary", width="stretch"):
                     raw_paths = [line.strip() for line in file_paths_text.split('\n') if line.strip()]
                     cleaned_paths = [clean_file_path(p) for p in raw_paths]
                     load_files([Path(p) for p in cleaned_paths])
@@ -939,7 +939,7 @@ def main():
             
             if uploaded_files:
                 st.write(f"Selected: {len(uploaded_files)} file(s)")
-                if st.button("⬆️ Process Uploads", type="primary", use_container_width=True):
+                if st.button("⬆️ Process Uploads", type="primary", width="stretch"):
                     process_uploaded_files(uploaded_files)
         
         st.divider()
@@ -1007,10 +1007,10 @@ def display_file_cards():
                 if file_info.is_valid and file_info.status != FileStatus.SCANNED:
                     btn_col1, btn_col2 = st.columns(2)
                     with btn_col1:
-                        if st.button(f"🔍", key=f"scan_{idx}", type="primary", help="Scan this file", use_container_width=True):
+                        if st.button(f"🔍", key=f"scan_{idx}", type="primary", help="Scan this file", width="stretch"):
                             scan_single_file(idx)
                     with btn_col2:
-                        if st.button(f"🚫", key=f"ignore_{idx}", help="Ignore this file", use_container_width=True):
+                        if st.button(f"🚫", key=f"ignore_{idx}", help="Ignore this file", width="stretch"):
                             ignore_file(idx)
                 elif not file_info.is_valid:
                     st.error("❌ Invalid")
@@ -1068,7 +1068,7 @@ def display_results_table():
                 st.markdown(f"**{Path(result_path).name}**")
             with col2:
                 if not has_deep_scan:
-                    if st.button("🔬 Deep Scan", key=f"deep_{idx}", use_container_width=True):
+                    if st.button("🔬 Deep Scan", key=f"deep_{idx}", width="stretch"):
                         perform_deep_scan(result_path, idx)
                 else:
                     st.success("✅ Analyzed")
@@ -1402,7 +1402,7 @@ def display_deep_scan_card(result: DeepScanResult):
             # Show top 10 by file count
             top_folders = sorted(result.folder_structure.items(), key=lambda x: x[1], reverse=True)[:10]
             folder_df = pd.DataFrame(top_folders, columns=["Folder", "Files"])
-            st.dataframe(folder_df, hide_index=True, use_container_width=True)
+            st.dataframe(folder_df, hide_index=True, width="stretch")
             
             # Show all folders in a hierarchical view
             if len(result.folder_structure) > 10:
