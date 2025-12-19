@@ -108,6 +108,8 @@ import json
 STATE_DIR = Path('state')
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_PATH = STATE_DIR / 'takeout_index.json'
+RECENT_FOLDERS_PATH = STATE_DIR / 'recent_folders.json'
+MAX_RECENT_FOLDERS = 10
 
 # --- File type definitions ---------------------------------------------------
 MEDIA_PHOTO_EXT = {
@@ -157,6 +159,48 @@ def save_index(index: Dict[str, Dict[str, float]]) -> None:
             json.dump(index, f, indent=2)
     except Exception as e:
         logger.exception(f'Failed to save index: {e}')
+
+
+# --- Recent folders helpers --------------------------------------------------
+def load_recent_folders() -> List[str]:
+    """Load list of recently accessed folders."""
+    if RECENT_FOLDERS_PATH.exists():
+        try:
+            with open(RECENT_FOLDERS_PATH, 'r', encoding='utf-8') as f:
+                folders = json.load(f)
+                # Filter to only existing folders
+                return [f for f in folders if Path(f).exists()]
+        except Exception:
+            logger.warning('Recent folders file unreadable; starting fresh.')
+    return []
+
+
+def save_recent_folders(folders: List[str]) -> None:
+    """Save list of recent folders."""
+    try:
+        with open(RECENT_FOLDERS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(folders, f, indent=2)
+    except Exception as e:
+        logger.exception(f'Failed to save recent folders: {e}')
+
+
+def add_recent_folder(folder_path: str) -> None:
+    """Add a folder to recent folders list."""
+    recent = st.session_state.recent_folders
+    folder_path = str(Path(folder_path).resolve())
+    
+    # Remove if already in list
+    if folder_path in recent:
+        recent.remove(folder_path)
+    
+    # Add to front
+    recent.insert(0, folder_path)
+    
+    # Keep only MAX_RECENT_FOLDERS
+    recent = recent[:MAX_RECENT_FOLDERS]
+    
+    st.session_state.recent_folders = recent
+    save_recent_folders(recent)
 
 
 # --- Data model --------------------------------------------------------------
@@ -495,41 +539,131 @@ def main():
         st.session_state.scanned_paths = set()
     if 'pending_files' not in st.session_state:
         st.session_state.pending_files = []  # List of FileInfo objects
+    if 'recent_folders' not in st.session_state:
+        st.session_state.recent_folders = load_recent_folders()
+    if 'current_browse_path' not in st.session_state:
+        st.session_state.current_browse_path = Path.home()
     
     # Sidebar for selection
     with st.sidebar:
         st.header("Select Source")
         
-        selection_mode = st.radio(
-            "Choose how to select:",
-            ["Folder", "Files"],
-            help="Select a folder to scan everything inside, or choose specific files"
-        )
+        # Create tabs for different selection methods
+        tab1, tab2, tab3 = st.tabs(["📁 Browse", "📋 Paste", "⬆️ Upload"])
         
-        if selection_mode == "Folder":
+        with tab1:
+            st.markdown("**Browse for folder:**")
+            
+            # Recent folders quick access
+            if st.session_state.recent_folders:
+                recent_folder = st.selectbox(
+                    "Recent folders:",
+                    options=['-- Select recent --'] + st.session_state.recent_folders,
+                    key='recent_select'
+                )
+                if recent_folder != '-- Select recent --':
+                    st.session_state.current_browse_path = Path(recent_folder)
+            
+            # Manual path entry with current path display
             folder_path = st.text_input(
                 "Folder Path",
-                placeholder="Enter folder path or paste from file explorer",
-                help="Paste the full path to a folder containing Takeout archives or data"
+                value=str(st.session_state.current_browse_path),
+                placeholder="Enter or edit folder path",
+                help="Type or paste a folder path"
             )
             
-            if folder_path and st.button("📁 Load Folder", type="primary"):
-                cleaned_path = clean_file_path(folder_path)
-                load_folder(Path(cleaned_path))
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("📁 Load Folder", type="primary", use_container_width=True):
+                    if folder_path:
+                        cleaned_path = clean_file_path(folder_path)
+                        path_obj = Path(cleaned_path)
+                        if path_obj.exists() and path_obj.is_dir():
+                            add_recent_folder(str(path_obj))
+                            load_folder(path_obj)
+                        else:
+                            st.error("Invalid folder path")
+            
+            with col2:
+                # Parent directory navigation
+                if st.button("⬆️ Up", use_container_width=True):
+                    current = Path(folder_path) if folder_path else st.session_state.current_browse_path
+                    if current.parent != current:
+                        st.session_state.current_browse_path = current.parent
+                        st.rerun()
+            
+            # Browse current directory
+            if folder_path:
+                browse_path = Path(folder_path)
+                if browse_path.exists() and browse_path.is_dir():
+                    with st.expander("📂 Browse subfolders", expanded=False):
+                        try:
+                            subdirs = [d for d in browse_path.iterdir() if d.is_dir()]
+                            if subdirs:
+                                for subdir in sorted(subdirs)[:20]:  # Limit to 20
+                                    if st.button(f"📁 {subdir.name}", key=f"sub_{subdir}", use_container_width=True):
+                                        st.session_state.current_browse_path = subdir
+                                        st.rerun()
+                                if len(subdirs) > 20:
+                                    st.caption(f"... and {len(subdirs) - 20} more")
+                            else:
+                                st.caption("No subfolders")
+                        except PermissionError:
+                            st.warning("⚠️ Permission denied")
         
-        else:  # Files mode
-            st.info("💡 Enter file paths (one per line) or paste from file explorer")
-            file_paths_text = st.text_area(
-                "File Paths",
-                placeholder="C:\\path\\to\\file1.zip\nC:\\path\\to\\file2.zip",
-                height=150,
-                help="Paste full paths to ZIP or TGZ files, one per line"
+        with tab2:
+            st.markdown("**Paste paths manually:**")
+            
+            paste_mode = st.radio(
+                "Type:",
+                ["Folder", "Files"],
+                horizontal=True,
+                label_visibility="collapsed"
             )
             
-            if file_paths_text and st.button("📄 Load Files", type="primary"):
-                raw_paths = [line.strip() for line in file_paths_text.split('\n') if line.strip()]
-                cleaned_paths = [clean_file_path(p) for p in raw_paths]
-                load_files([Path(p) for p in cleaned_paths])
+            if paste_mode == "Folder":
+                folder_path_paste = st.text_input(
+                    "Folder Path",
+                    placeholder="Paste folder path from file explorer",
+                    help="Right-click folder → Copy as path",
+                    key="paste_folder"
+                )
+                if folder_path_paste and st.button("📁 Load Pasted Folder", type="primary", use_container_width=True):
+                    cleaned_path = clean_file_path(folder_path_paste)
+                    path_obj = Path(cleaned_path)
+                    if path_obj.exists():
+                        add_recent_folder(str(path_obj))
+                    load_folder(path_obj)
+            else:
+                st.info("💡 One path per line")
+                file_paths_text = st.text_area(
+                    "File Paths",
+                    placeholder="C:\\path\\to\\file1.zip\nC:\\path\\to\\file2.zip",
+                    height=150,
+                    help="Shift+Right-click files → Copy as path",
+                    key="paste_files"
+                )
+                if file_paths_text and st.button("📄 Load Pasted Files", type="primary", use_container_width=True):
+                    raw_paths = [line.strip() for line in file_paths_text.split('\n') if line.strip()]
+                    cleaned_paths = [clean_file_path(p) for p in raw_paths]
+                    load_files([Path(p) for p in cleaned_paths])
+        
+        with tab3:
+            st.markdown("**Upload archives:**")
+            st.info("⚠️ Large files may take time to upload")
+            
+            uploaded_files = st.file_uploader(
+                "Choose ZIP/TGZ files",
+                type=['zip', 'tgz', 'tar.gz'],
+                accept_multiple_files=True,
+                help="Select one or more archive files to upload and scan",
+                label_visibility="collapsed"
+            )
+            
+            if uploaded_files:
+                st.write(f"Selected: {len(uploaded_files)} file(s)")
+                if st.button("⬆️ Process Uploads", type="primary", use_container_width=True):
+                    process_uploaded_files(uploaded_files)
         
         st.divider()
         
@@ -934,6 +1068,42 @@ def process_files(file_paths: List[Path]):
         progress_bar.empty()
         st.success(f"✅ Scanned {len(valid_files)} file(s)")
         st.rerun()
+
+
+def process_uploaded_files(uploaded_files):
+    """Process files uploaded through Streamlit's file uploader."""
+    import tempfile
+    import shutil
+    
+    if not uploaded_files:
+        return
+    
+    # Create temp directory for uploads
+    temp_dir = Path(tempfile.mkdtemp(prefix='takeout_scout_'))
+    
+    try:
+        with st.spinner(f"Processing {len(uploaded_files)} uploaded file(s)..."):
+            file_paths = []
+            
+            for uploaded_file in uploaded_files:
+                # Save uploaded file to temp location
+                temp_path = temp_dir / uploaded_file.name
+                with open(temp_path, 'wb') as f:
+                    f.write(uploaded_file.getbuffer())
+                file_paths.append(temp_path)
+                logger.info(f"Saved upload: {uploaded_file.name} ({human_size(uploaded_file.size)})")
+            
+            # Now scan them
+            load_files(file_paths)
+            st.success(f"✅ Uploaded and loaded {len(file_paths)} file(s)")
+            
+    except Exception as e:
+        logger.exception(f"Error processing uploads: {e}")
+        st.error(f"❌ Error processing uploads: {e}")
+    finally:
+        # Cleanup temp directory after a delay (files might still be in use)
+        # Note: In production, you might want a better cleanup strategy
+        pass
 
 
 def export_csv():
