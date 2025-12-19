@@ -386,7 +386,7 @@ def validate_tar(path: Path) -> bool:
         return False
 
 
-def scan_archive(path: Path) -> ArchiveSummary:
+def scan_archive(path: Path, progress_callback=None) -> ArchiveSummary:
     try:
         size = path.stat().st_size
     except Exception:
@@ -394,12 +394,24 @@ def scan_archive(path: Path) -> ArchiveSummary:
 
     members: List[str] = []
     try:
+        if progress_callback:
+            progress_callback(f"Opening {path.name}...", 0)
+        
         if path.suffix.lower() == '.zip':
             with zipfile.ZipFile(path) as zf:
+                if progress_callback:
+                    total = len(zf.namelist())
+                    progress_callback(f"Reading {total:,} entries from ZIP...", 0.3)
                 members = list(iter_zip_members(zf))
+                if progress_callback:
+                    progress_callback(f"Analyzing {len(members):,} files...", 0.7)
         elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
             with tarfile.open(path, 'r:*') as tf:
+                if progress_callback:
+                    progress_callback(f"Reading entries from TGZ...", 0.3)
                 members = list(iter_tar_members(tf))
+                if progress_callback:
+                    progress_callback(f"Analyzing {len(members):,} files...", 0.7)
         else:
             logger.warning(f"Skipping unsupported archive: {path}")
             return ArchiveSummary(
@@ -442,11 +454,16 @@ def scan_archive(path: Path) -> ArchiveSummary:
     )
 
 
-def scan_directory(path: Path) -> ArchiveSummary:
+def scan_directory(path: Path, progress_callback=None) -> ArchiveSummary:
     """Scan an uncompressed directory and return a summary."""
     try:
         files: List[str] = []
         total_size = 0
+        file_count = 0
+        
+        if progress_callback:
+            progress_callback(f"Scanning directory {path.name}...", 0)
+        
         for root, _dirs, filenames in os.walk(path):
             for name in filenames:
                 file_path = Path(root) / name
@@ -456,6 +473,14 @@ def scan_directory(path: Path) -> ArchiveSummary:
                     pass
                 rel_path = str(file_path.relative_to(path))
                 files.append(rel_path)
+                file_count += 1
+                
+                # Update progress every 100 files
+                if progress_callback and file_count % 100 == 0:
+                    progress_callback(f"Found {file_count:,} files...", min(0.8, file_count / 10000))
+        
+        if progress_callback:
+            progress_callback(f"Analyzing {len(files):,} files...", 0.9)
         
         photos, videos, jsons, other = tally_exts(files)
         svc = guess_service_from_members(files)
@@ -486,11 +511,15 @@ def scan_directory(path: Path) -> ArchiveSummary:
         )
 
 
-def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
+def find_archives_and_dirs(root: Path, progress_callback=None) -> Tuple[List[Path], List[Path]]:
     """Find both archives and Takeout directories by recursively searching all subdirectories."""
     archives: List[Path] = []
     directories: List[Path] = []
     seen_dirs = set()  # Track directories we've already added
+    dir_count = 0
+    
+    if progress_callback:
+        progress_callback(f"Scanning {root.name}...", 0.1)
     
     # Check if root itself is a Takeout directory
     if root.is_dir():
@@ -508,6 +537,9 @@ def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
     
     # Recursively walk through all subdirectories
     for dirpath, dirnames, filenames in os.walk(root):
+        dir_count += 1
+        if progress_callback and dir_count % 50 == 0:
+            progress_callback(f"Searched {dir_count} directories, found {len(archives)} archives...", min(0.9, 0.1 + (dir_count / 1000)))
         current_dir = Path(dirpath)
         
         # Find all archive files
@@ -875,28 +907,38 @@ def load_folder(folder_path: Path):
         st.caption(f"Resolved path: `{folder_path.resolve()}`")
         return
     
-    with st.spinner(f"Loading files from {folder_path.name}..."):
-        archives, directories = find_archives_and_dirs(folder_path)
-        all_items = list(archives) + list(directories)
-        
-        if not all_items:
-            st.warning(f"⚠️ No archives or Takeout directories found in {folder_path}")
-            # Still validate the folder itself
-            file_info = validate_and_get_info(folder_path)
-            st.session_state.pending_files.append(file_info)
-            st.rerun()
-            return
-        
-        # Validate all found files
-        progress_bar = st.progress(0, text=f"Validating 0/{len(all_items)} files...")
-        for i, item in enumerate(all_items, 1):
-            file_info = validate_and_get_info(item)
-            st.session_state.pending_files.append(file_info)
-            progress_bar.progress(i / len(all_items), text=f"Validating {i}/{len(all_items)} files...")
-        
+    progress_bar = st.progress(0, text=f"Searching {folder_path.name}...")
+    status_text = st.empty()
+    
+    def update_search_progress(message: str, progress: float):
+        progress_bar.progress(progress, text=message)
+        status_text.text(message)
+    
+    archives, directories = find_archives_and_dirs(folder_path, progress_callback=update_search_progress)
+    all_items = list(archives) + list(directories)
+    
+    if not all_items:
         progress_bar.empty()
-        st.success(f"✅ Loaded {len(all_items)} files")
+        status_text.empty()
+        st.warning(f"⚠️ No archives or Takeout directories found in {folder_path}")
+        # Still validate the folder itself
+        file_info = validate_and_get_info(folder_path)
+        st.session_state.pending_files.append(file_info)
         st.rerun()
+        return
+    
+    # Validate all found files
+    status_text.text(f"Found {len(all_items)} items, validating...")
+    progress_bar.progress(0, text=f"Validating 0/{len(all_items)} files...")
+    for i, item in enumerate(all_items, 1):
+        file_info = validate_and_get_info(item)
+        st.session_state.pending_files.append(file_info)
+        progress_bar.progress(i / len(all_items), text=f"Validating {i}/{len(all_items)} files...")
+    
+    progress_bar.empty()
+    status_text.empty()
+    st.success(f"✅ Loaded {len(all_items)} files")
+    st.rerun()
 
 
 def load_files(file_paths: List[Path]):
@@ -942,22 +984,31 @@ def scan_single_file(index: int):
     """Scan a single file from the pending list."""
     file_info = st.session_state.pending_files[index]
     
-    with st.spinner(f"Scanning {file_info.name}..."):
-        try:
-            if file_info.file_type == 'directory':
-                summary = scan_directory(file_info.path)
-            else:
-                summary = scan_archive(file_info.path)
-            
-            st.session_state.results.append(summary)
-            st.session_state.scanned_paths.add(str(file_info.path))
-            
-            # Update status
-            file_info.status = FileStatus.SCANNED
-            st.session_state.pending_files[index] = file_info
-            
-            st.success(f"✅ Scanned {file_info.name}")
-            st.rerun()
+    # Create progress tracking
+    progress_bar = st.progress(0, text=f"Initializing scan of {file_info.name}...")
+    status_text = st.empty()
+    
+    def update_progress(message: str, progress: float):
+        progress_bar.progress(progress, text=message)
+        status_text.text(message)
+    
+    try:
+        if file_info.file_type == 'directory':
+            summary = scan_directory(file_info.path, progress_callback=update_progress)
+        else:
+            summary = scan_archive(file_info.path, progress_callback=update_progress)
+        
+        st.session_state.results.append(summary)
+        st.session_state.scanned_paths.add(str(file_info.path))
+        
+        # Update status
+        file_info.status = FileStatus.SCANNED
+        st.session_state.pending_files[index] = file_info
+        
+        progress_bar.empty()
+        status_text.empty()
+        st.success(f"✅ Scanned {file_info.name}")
+        st.rerun()
             
         except Exception as e:
             logger.exception(f"Failed to scan {file_info.path}: {e}")
@@ -979,13 +1030,25 @@ def scan_all_pending():
         return
     
     progress_bar = st.progress(0, text=f"Scanning 0/{len(valid_files)} files...")
+    detail_text = st.empty()
     
     for count, (index, file_info) in enumerate(valid_files, 1):
+        base_progress = (count - 1) / len(valid_files)
+        progress_increment = 1.0 / len(valid_files)
+        
+        def update_progress(message: str, sub_progress: float):
+            overall_progress = base_progress + (sub_progress * progress_increment)
+            progress_bar.progress(
+                overall_progress,
+                text=f"[{count}/{len(valid_files)}] {file_info.name}"
+            )
+            detail_text.text(message)
+        
         try:
             if file_info.file_type == 'directory':
-                summary = scan_directory(file_info.path)
+                summary = scan_directory(file_info.path, progress_callback=update_progress)
             else:
-                summary = scan_archive(file_info.path)
+                summary = scan_archive(file_info.path, progress_callback=update_progress)
             
             st.session_state.results.append(summary)
             st.session_state.scanned_paths.add(str(file_info.path))
@@ -998,9 +1061,10 @@ def scan_all_pending():
             file_info.error_message = str(e)
             st.session_state.pending_files[index] = file_info
         
-        progress_bar.progress(count / len(valid_files), text=f"Scanning {count}/{len(valid_files)} files...")
+        progress_bar.progress(count / len(valid_files), text=f"Completed {count}/{len(valid_files)} files")
     
     progress_bar.empty()
+    detail_text.empty()
     st.success(f"✅ Scanned {len(valid_files)} files")
     st.rerun()
 
