@@ -1020,9 +1020,8 @@ def scan_single_file(index: int):
         st.session_state.results.append(summary)
         st.session_state.scanned_paths.add(str(file_info.path))
         
-        # Update status
-        file_info.status = FileStatus.SCANNED
-        st.session_state.pending_files[index] = file_info
+        # Remove from pending files after successful scan
+        st.session_state.pending_files.pop(index)
         
         progress_bar.empty()
         status_text.empty()
@@ -1051,7 +1050,7 @@ def ignore_file(index: int):
 def scan_all_pending():
     """Scan all pending valid files."""
     valid_files = [
-        (i, f) for i, f in enumerate(st.session_state.pending_files)
+        f for f in st.session_state.pending_files
         if f.is_valid and f.status != FileStatus.SCANNED
     ]
     
@@ -1062,7 +1061,11 @@ def scan_all_pending():
     progress_bar = st.progress(0, text=f"Scanning 0/{len(valid_files)} files...")
     detail_text = st.empty()
     
-    for count, (index, file_info) in enumerate(valid_files, 1):
+    scanned_count = 0
+    error_count = 0
+    
+    # Process files (we'll remove them as we go, so always process index 0)
+    for count, file_info in enumerate(valid_files, 1):
         base_progress = (count - 1) / len(valid_files)
         progress_increment = 1.0 / len(valid_files)
         
@@ -1082,20 +1085,31 @@ def scan_all_pending():
             
             st.session_state.results.append(summary)
             st.session_state.scanned_paths.add(str(file_info.path))
-            file_info.status = FileStatus.SCANNED
-            st.session_state.pending_files[index] = file_info
+            
+            # Remove from pending files after successful scan
+            st.session_state.pending_files.remove(file_info)
+            scanned_count += 1
             
         except Exception as e:
             logger.exception(f"Failed to scan {file_info.path}: {e}")
             file_info.status = FileStatus.ERROR
             file_info.error_message = str(e)
-            st.session_state.pending_files[index] = file_info
+            # Keep error files in the list but update their status
+            for i, f in enumerate(st.session_state.pending_files):
+                if f.path == file_info.path:
+                    st.session_state.pending_files[i] = file_info
+                    break
+            error_count += 1
         
         progress_bar.progress(count / len(valid_files), text=f"Completed {count}/{len(valid_files)} files")
     
     progress_bar.empty()
     detail_text.empty()
-    st.success(f"✅ Scanned {len(valid_files)} files")
+    
+    if error_count > 0:
+        st.warning(f"✅ Scanned {scanned_count} files, ⚠️ {error_count} errors")
+    else:
+        st.success(f"✅ Scanned {scanned_count} files")
     st.rerun()
 
 
