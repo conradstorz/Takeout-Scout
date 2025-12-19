@@ -1023,13 +1023,13 @@ def scan_single_file(index: int):
         status_text.empty()
         st.success(f"✅ Scanned {file_info.name}")
         st.rerun()
-            
-        except Exception as e:
-            logger.exception(f"Failed to scan {file_info.path}: {e}")
-            file_info.status = FileStatus.ERROR
-            file_info.error_message = str(e)
-            st.session_state.pending_files[index] = file_info
-            st.error(f"❌ Error scanning {file_info.name}: {e}")
+    
+    except Exception as e:
+        logger.exception(f"Failed to scan {file_info.path}: {e}")
+        file_info.status = FileStatus.ERROR
+        file_info.error_message = str(e)
+        st.session_state.pending_files[index] = file_info
+        st.error(f"❌ Error scanning {file_info.name}: {e}")
 
 
 def scan_all_pending():
