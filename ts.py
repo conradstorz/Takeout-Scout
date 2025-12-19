@@ -230,6 +230,43 @@ class ArchiveSummary:
         }
 
 
+@dataclass
+class DeepScanResult:
+    """Results from deep analysis of a Takeout archive."""
+    path: str
+    
+    # Photo/JSON pairing analysis
+    paired_photos: int  # Photos with matching JSON
+    unpaired_photos: int  # Photos without JSON
+    orphaned_json: int  # JSON without matching photo
+    
+    # Folder organization
+    organization_type: str  # 'by_year', 'by_album', 'by_date', 'flat', 'mixed'
+    folder_structure: Dict[str, int]  # Folder path -> file count
+    year_distribution: Dict[str, int]  # Year -> count
+    
+    # Content details
+    albums: List[str]  # Album names found
+    date_range: Optional[Tuple[str, str]]  # Earliest, Latest dates
+    
+    # Issues found
+    issues: List[str]  # List of problems discovered
+    
+    def to_dict(self) -> dict:
+        return {
+            'Path': Path(self.path).name,
+            'Paired Photos': self.paired_photos,
+            'Unpaired Photos': self.unpaired_photos,
+            'Orphaned JSON': self.orphaned_json,
+            'Organization': self.organization_type,
+            'Folders': len(self.folder_structure),
+            'Years': ', '.join(sorted(self.year_distribution.keys())) if self.year_distribution else 'Unknown',
+            'Albums': len(self.albums),
+            'Date Range': f"{self.date_range[0]} to {self.date_range[1]}" if self.date_range else 'Unknown',
+            'Issues': len(self.issues),
+        }
+
+
 # --- Scanner -----------------------------------------------------------------
 def guess_service_from_members(members: Iterable[str]) -> str:
     joined = '\n'.join(members)
@@ -511,6 +548,189 @@ def scan_directory(path: Path, progress_callback=None) -> ArchiveSummary:
         )
 
 
+# --- Deep Scan Functions -----------------------------------------------------
+def deep_scan_archive(path: Path, progress_callback=None) -> DeepScanResult:
+    """Perform deep analysis of an archive's structure and contents."""
+    import json as json_module
+    from collections import defaultdict
+    import re
+    
+    if progress_callback:
+        progress_callback("Starting deep scan...", 0.1)
+    
+    members: List[str] = []
+    
+    # Extract file list
+    try:
+        if path.suffix.lower() == '.zip':
+            with zipfile.ZipFile(path) as zf:
+                members = [m for m in list(iter_zip_members(zf))]
+        elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
+            with tarfile.open(path, 'r:*') as tf:
+                members = [m for m in list(iter_tar_members(tf))]
+    except Exception as e:
+        logger.exception(f"Failed to read archive for deep scan: {e}")
+        return DeepScanResult(
+            path=str(path),
+            paired_photos=0, unpaired_photos=0, orphaned_json=0,
+            organization_type='error',
+            folder_structure={}, year_distribution={},
+            albums=[], date_range=None,
+            issues=[f"Failed to read archive: {e}"]
+        )
+    
+    if progress_callback:
+        progress_callback(f"Analyzing {len(members)} files...", 0.3)
+    
+    return analyze_file_structure(members, str(path), progress_callback)
+
+
+def deep_scan_directory(path: Path, progress_callback=None) -> DeepScanResult:
+    """Perform deep analysis of a directory's structure and contents."""
+    if progress_callback:
+        progress_callback("Collecting files...", 0.1)
+    
+    members: List[str] = []
+    for root, _dirs, filenames in os.walk(path):
+        for name in filenames:
+            file_path = Path(root) / name
+            rel_path = str(file_path.relative_to(path))
+            members.append(rel_path)
+    
+    if progress_callback:
+        progress_callback(f"Analyzing {len(members)} files...", 0.3)
+    
+    return analyze_file_structure(members, str(path), progress_callback)
+
+
+def analyze_file_structure(members: List[str], base_path: str, progress_callback=None) -> DeepScanResult:
+    """Analyze the structure and organization of files."""
+    from collections import defaultdict
+    import re
+    
+    # Separate photos and JSON files
+    photos = {}  # basename -> full path
+    jsons = {}   # basename -> full path
+    
+    folder_structure = defaultdict(int)
+    year_distribution = defaultdict(int)
+    albums = set()
+    dates = []
+    issues = []
+    
+    # Pattern to extract dates from filenames or paths
+    date_pattern = re.compile(r'(\d{4})[_-]?(\d{2})[_-]?(\d{2})')
+    year_pattern = re.compile(r'/(\d{4})/')
+    
+    for idx, member in enumerate(members):
+        if progress_callback and idx % 500 == 0:
+            progress_callback(f"Analyzing file {idx}/{len(members)}...", 0.3 + (idx / len(members)) * 0.5)
+        
+        member_lower = member.lower()
+        folder = str(Path(member).parent)
+        folder_structure[folder] += 1
+        
+        # Detect albums (folder names that aren't years or generic)
+        folder_parts = folder.split('/')
+        for part in folder_parts:
+            if part and not part.isdigit() and part.lower() not in {'google photos', 'takeout', 'photos', 'archive'}:
+                if not re.match(r'^\d{4}$', part):  # Not a year
+                    albums.add(part)
+        
+        # Extract years from paths
+        year_match = year_pattern.search(member)
+        if year_match:
+            year_distribution[year_match.group(1)] += 1
+        
+        # Extract dates from filenames
+        date_match = date_pattern.search(member)
+        if date_match:
+            try:
+                date_str = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+                dates.append(date_str)
+            except:
+                pass
+        
+        # Categorize photos and JSON
+        if any(member_lower.endswith(ext) for ext in MEDIA_PHOTO_EXT):
+            base = Path(member).stem
+            photos[f"{folder}/{base}"] = member
+        elif member_lower.endswith('.json'):
+            base = Path(member).stem
+            # JSON files often have .jpg.json or similar
+            if '.' in base:
+                base = base.rsplit('.', 1)[0]
+            jsons[f"{folder}/{base}"] = member
+    
+    if progress_callback:
+        progress_callback("Analyzing pairing and organization...", 0.9)
+    
+    # Analyze photo/JSON pairing
+    photo_bases = set(photos.keys())
+    json_bases = set(jsons.keys())
+    
+    paired = photo_bases & json_bases
+    unpaired_photos = photo_bases - json_bases
+    orphaned_json = json_bases - photo_bases
+    
+    # Detect organization type
+    org_type = detect_organization_type(folder_structure, year_distribution, albums)
+    
+    # Date range
+    date_range = None
+    if dates:
+        sorted_dates = sorted(dates)
+        date_range = (sorted_dates[0], sorted_dates[-1])
+    
+    # Identify issues
+    if len(unpaired_photos) > len(paired) * 0.5:
+        issues.append(f"Many photos missing JSON metadata ({len(unpaired_photos)} unpaired)")
+    
+    if len(orphaned_json) > 100:
+        issues.append(f"{len(orphaned_json)} JSON files without matching photos")
+    
+    if len(folder_structure) > 1000:
+        issues.append(f"Highly fragmented: {len(folder_structure)} folders")
+    
+    if not year_distribution:
+        issues.append("No year information found in folder structure")
+    
+    return DeepScanResult(
+        path=base_path,
+        paired_photos=len(paired),
+        unpaired_photos=len(unpaired_photos),
+        orphaned_json=len(orphaned_json),
+        organization_type=org_type,
+        folder_structure=dict(folder_structure),
+        year_distribution=dict(year_distribution),
+        albums=sorted(list(albums))[:50],  # Limit to 50 albums
+        date_range=date_range,
+        issues=issues
+    )
+
+
+def detect_organization_type(folder_structure: Dict[str, int], year_dist: Dict[str, int], albums: set) -> str:
+    """Detect how the content is organized."""
+    if not folder_structure or len(folder_structure) == 1:
+        return 'flat'
+    
+    # Check if organized by year
+    year_folders = sum(1 for folder in folder_structure.keys() if any(year in folder for year in year_dist.keys()))
+    if year_folders > len(folder_structure) * 0.5:
+        return 'by_year'
+    
+    # Check if organized by albums
+    if len(albums) > 5 and len(folder_structure) > 3:
+        return 'by_album'
+    
+    # Check if organized by date (YYYY-MM-DD pattern)
+    date_folders = sum(1 for folder in folder_structure.keys() if re.search(r'\d{4}-\d{2}-\d{2}', folder))
+    if date_folders > len(folder_structure) * 0.3:
+        return 'by_date'
+    
+    return 'mixed'
+
+
 def find_archives_and_dirs(root: Path, progress_callback=None) -> Tuple[List[Path], List[Path]]:
     """Find both archives and Takeout directories by recursively searching all subdirectories."""
     archives: List[Path] = []
@@ -598,6 +818,8 @@ def main():
         st.session_state.recent_folders = load_recent_folders()
     if 'current_browse_path' not in st.session_state:
         st.session_state.current_browse_path = Path.home()
+    if 'deep_scan_results' not in st.session_state:
+        st.session_state.deep_scan_results = {}  # path -> DeepScanResult
     
     # Sidebar for selection
     with st.sidebar:
@@ -831,6 +1053,31 @@ def display_results_table():
     col3.metric("Videos", f"{total_videos:,}")
     col4.metric("JSON", f"{total_json:,}")
     col5.metric("Total Size", human_size(total_size))
+    
+    # Deep scan section
+    st.divider()
+    st.subheader("🔬 Deep Scan Analysis")
+    
+    for idx, result in enumerate(st.session_state.results):
+        result_path = result.path
+        has_deep_scan = result_path in st.session_state.deep_scan_results
+        
+        with st.container():
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.markdown(f"**{Path(result_path).name}**")
+            with col2:
+                if not has_deep_scan:
+                    if st.button("🔬 Deep Scan", key=f"deep_{idx}", use_container_width=True):
+                        perform_deep_scan(result_path, idx)
+                else:
+                    st.success("✅ Analyzed")
+            
+            # Display deep scan results if available
+            if has_deep_scan:
+                display_deep_scan_card(st.session_state.deep_scan_results[result_path])
+            
+            st.divider()
 
 
 def show_welcome_screen():
@@ -1045,6 +1292,93 @@ def ignore_file(index: int):
     st.session_state.pending_files.pop(index)
     st.success(f"🚫 Ignored {file_info.name}")
     st.rerun()
+
+
+def perform_deep_scan(file_path: str, index: int):
+    """Perform deep scan on a previously scanned file."""
+    path = Path(file_path)
+    
+    progress_bar = st.progress(0, text=f"Deep scanning {path.name}...")
+    status_text = st.empty()
+    
+    def update_progress(message: str, progress: float):
+        progress_bar.progress(progress, text=message)
+        status_text.text(message)
+    
+    try:
+        if path.is_file():
+            result = deep_scan_archive(path, progress_callback=update_progress)
+        else:
+            result = deep_scan_directory(path, progress_callback=update_progress)
+        
+        st.session_state.deep_scan_results[file_path] = result
+        
+        progress_bar.empty()
+        status_text.empty()
+        st.success(f"🔬 Deep scan complete for {path.name}")
+        st.rerun()
+        
+    except Exception as e:
+        logger.exception(f"Failed to deep scan {file_path}: {e}")
+        progress_bar.empty()
+        status_text.empty()
+        st.error(f"❌ Deep scan failed: {e}")
+
+
+def display_deep_scan_card(result: DeepScanResult):
+    """Display detailed deep scan results in an expandable card."""
+    with st.expander("📊 View Deep Scan Details", expanded=True):
+        # Photo/JSON Pairing Analysis
+        st.markdown("#### 📷 Photo & Metadata Pairing")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("✅ Paired Photos", f"{result.paired_photos:,}", 
+                   help="Photos with matching JSON metadata files")
+        col2.metric("📸 Unpaired Photos", f"{result.unpaired_photos:,}",
+                   help="Photos without JSON metadata")
+        col3.metric("🗒️ Orphaned JSON", f"{result.orphaned_json:,}",
+                   help="JSON files without matching photos")
+        
+        # Organization Analysis
+        st.markdown("#### 📁 Folder Organization")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**Type:** `{result.organization_type}`")
+            st.markdown(f"**Total Folders:** {len(result.folder_structure):,}")
+        with col2:
+            if result.date_range:
+                st.markdown(f"**Date Range:**")
+                st.caption(f"{result.date_range[0]} → {result.date_range[1]}")
+        
+        # Year Distribution
+        if result.year_distribution:
+            st.markdown("#### 📅 Content by Year")
+            year_data = pd.DataFrame([
+                {"Year": year, "Files": count}
+                for year, count in sorted(result.year_distribution.items())
+            ])
+            st.bar_chart(year_data.set_index("Year"))
+        
+        # Albums
+        if result.albums:
+            st.markdown(f"#### 📚 Albums ({len(result.albums)})")
+            if len(result.albums) <= 10:
+                st.write(", ".join(result.albums))
+            else:
+                with st.expander(f"Show all {len(result.albums)} albums"):
+                    st.write(", ".join(result.albums))
+        
+        # Top Folders
+        if result.folder_structure:
+            st.markdown("#### 📂 Top Folders by File Count")
+            top_folders = sorted(result.folder_structure.items(), key=lambda x: x[1], reverse=True)[:10]
+            folder_df = pd.DataFrame(top_folders, columns=["Folder", "Files"])
+            st.dataframe(folder_df, hide_index=True, use_container_width=True)
+        
+        # Issues Found
+        if result.issues:
+            st.markdown("#### ⚠️ Issues Detected")
+            for issue in result.issues:
+                st.warning(issue)
 
 
 def scan_all_pending():
