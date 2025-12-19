@@ -1214,4 +1214,22 @@ def export_csv():
 
 
 if __name__ == '__main__':
+    # Check if running via streamlit or directly
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is None:
+            # Not running via streamlit, launch it properly
+            import sys
+            import subprocess
+            from pathlib import Path
+            
+            script_path = Path(__file__).resolve()
+            cmd = [sys.executable, "-m", "streamlit", "run", str(script_path)] + sys.argv[1:]
+            subprocess.run(cmd)
+            sys.exit(0)
+    except ImportError:
+        pass
+    
+    # Running via streamlit, proceed normally
     main()
+
