@@ -781,10 +781,15 @@ def display_file_cards():
                 st.markdown(f"**Type:** {file_info.file_type or 'Unknown'}")
             
             with col3:
-                # Scan button
+                # Scan and Ignore buttons
                 if file_info.is_valid and file_info.status != FileStatus.SCANNED:
-                    if st.button(f"🔍 Scan", key=f"scan_{idx}", type="primary"):
-                        scan_single_file(idx)
+                    btn_col1, btn_col2 = st.columns(2)
+                    with btn_col1:
+                        if st.button(f"🔍", key=f"scan_{idx}", type="primary", help="Scan this file", use_container_width=True):
+                            scan_single_file(idx)
+                    with btn_col2:
+                        if st.button(f"🚫", key=f"ignore_{idx}", help="Ignore this file", use_container_width=True):
+                            ignore_file(idx)
                 elif not file_info.is_valid:
                     st.error("❌ Invalid")
                 else:
@@ -1030,6 +1035,17 @@ def scan_single_file(index: int):
         file_info.error_message = str(e)
         st.session_state.pending_files[index] = file_info
         st.error(f"❌ Error scanning {file_info.name}: {e}")
+
+
+def ignore_file(index: int):
+    """Remove a file from the pending list without scanning it."""
+    file_info = st.session_state.pending_files[index]
+    logger.info(f"Ignoring file: {file_info.path}")
+    
+    # Remove from pending files
+    st.session_state.pending_files.pop(index)
+    st.success(f"🚫 Ignored {file_info.name}")
+    st.rerun()
 
 
 def scan_all_pending():
