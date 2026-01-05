@@ -23,6 +23,7 @@ License: MIT
 from __future__ import annotations
 
 import csv
+import io
 import os
 import re
 import sys
@@ -35,6 +36,15 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+# --- PIL/Pillow for EXIF metadata (optional) ---------------------------------
+try:
+    from PIL import Image
+    from PIL.ExifTags import TAGS
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+    logger.warning('PIL/Pillow not installed; photo metadata extraction disabled.')
 
 # --- Logging setup -----------------------------------------------------------
 try:
@@ -74,11 +84,17 @@ if _HAS_LOGURU:
     )
 
 import json
+import hashlib
 
 # --- State (persistent index) -----------------------------------------------
 STATE_DIR = Path('state')
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_PATH = STATE_DIR / 'takeout_index.json'
+
+# --- Discovery tracking -----------------------------------------------------
+DISCOVERIES_DIR = Path('takeouts_discovered')
+DISCOVERIES_DIR.mkdir(parents=True, exist_ok=True)
+DISCOVERIES_INDEX_PATH = Path('discoveries_index.json')
 
 # --- Simple size helpers -----------------------------------------------------
 
@@ -97,6 +113,172 @@ SERVICE_HINTS = {
     'Hangouts/Chat': re.compile(r'Hangouts|Chat', re.I),
     'Blogger/Album Archive': re.compile(r'Blogger|Album Archive|Picasa', re.I),
 }
+
+# --- Photo metadata helpers --------------------------------------------------
+
+@dataclass
+class PhotoMetadata:
+    """Container for photo EXIF metadata."""
+    has_exif: bool = False
+    has_gps: bool = False
+    has_datetime: bool = False
+    camera_make: Optional[str] = None
+    camera_model: Optional[str] = None
+    datetime_original: Optional[str] = None
+    gps_latitude: Optional[float] = None
+    gps_longitude: Optional[float] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
+@dataclass
+class FileDetails:
+    """Detailed information about a file within a takeout."""
+    path: str
+    size: int
+    file_type: str  # 'photo', 'video', 'json', 'other'
+    extension: str
+    metadata: Optional[Dict] = None  # EXIF or other metadata
+    
+    def to_dict(self) -> dict:
+        return {
+            'path': self.path,
+            'size': self.size,
+            'file_type': self.file_type,
+            'extension': self.extension,
+            'metadata': self.metadata,
+        }
+
+
+@dataclass
+class TakeoutDiscovery:
+    """Complete tracking information for a discovered takeout."""
+    source_path: str
+    source_type: str  # 'zip', 'tgz', 'directory'
+    first_discovered: str  # ISO format datetime
+    last_scanned: str  # ISO format datetime
+    parts_group: str
+    service_guess: str
+    file_count: int
+    photos: int
+    videos: int
+    json_sidecars: int
+    other: int
+    compressed_size: int
+    photos_with_exif: int = 0
+    photos_with_gps: int = 0
+    photos_with_datetime: int = 0
+    photos_checked: int = 0
+    scan_count: int = 1
+    file_details: List[Dict] = None  # List of FileDetails.to_dict()
+    notes: str = ''
+    
+    def __post_init__(self):
+        if self.file_details is None:
+            self.file_details = []
+    
+    def to_dict(self) -> dict:
+        return {
+            'source_path': self.source_path,
+            'source_type': self.source_type,
+            'first_discovered': self.first_discovered,
+            'last_scanned': self.last_scanned,
+            'parts_group': self.parts_group,
+            'service_guess': self.service_guess,
+            'file_count': self.file_count,
+            'photos': self.photos,
+            'videos': self.videos,
+            'json_sidecars': self.json_sidecars,
+            'other': self.other,
+            'compressed_size': self.compressed_size,
+            'photos_with_exif': self.photos_with_exif,
+            'photos_with_gps': self.photos_with_gps,
+            'photos_with_datetime': self.photos_with_datetime,
+            'photos_checked': self.photos_checked,
+            'scan_count': self.scan_count,
+            'file_details': self.file_details,
+            'notes': self.notes,
+        }
+
+
+def extract_photo_metadata(file_data: bytes, filename: str) -> Optional[PhotoMetadata]:
+    """Extract EXIF metadata from photo file bytes.
+    
+    Args:
+        file_data: Raw bytes of the image file
+        filename: Name of the file (for logging)
+    
+    Returns:
+        PhotoMetadata object if extraction succeeds, None otherwise
+    """
+    if not _HAS_PIL:
+        return None
+    
+    try:
+        img = Image.open(io.BytesIO(file_data))
+        metadata = PhotoMetadata()
+        
+        # Get basic dimensions
+        metadata.width = img.width
+        metadata.height = img.height
+        
+        # Try to get EXIF data
+        exif_data = img.getexif()
+        if not exif_data:
+            return metadata
+        
+        metadata.has_exif = True
+        
+        # Extract common EXIF tags
+        for tag_id, value in exif_data.items():
+            tag_name = TAGS.get(tag_id, tag_id)
+            
+            if tag_name == 'Make':
+                metadata.camera_make = str(value).strip()
+            elif tag_name == 'Model':
+                metadata.camera_model = str(value).strip()
+            elif tag_name == 'DateTimeOriginal':
+                metadata.datetime_original = str(value)
+                metadata.has_datetime = True
+            elif tag_name == 'DateTime' and not metadata.datetime_original:
+                metadata.datetime_original = str(value)
+                metadata.has_datetime = True
+            elif tag_name == 'GPSInfo':
+                metadata.has_gps = True
+                # GPS data is complex; just mark presence for now
+                # Future: parse GPSInfo dict for exact coordinates
+        
+        return metadata
+    
+    except Exception as e:
+        logger.debug(f'Failed to extract metadata from {filename}: {e}')
+        return None
+
+
+def extract_metadata_from_zip(zf: zipfile.ZipFile, member_path: str) -> Optional[PhotoMetadata]:
+    """Extract metadata from a photo inside a ZIP archive."""
+    try:
+        with zf.open(member_path) as f:
+            file_data = f.read()
+        return extract_photo_metadata(file_data, member_path)
+    except Exception as e:
+        logger.debug(f'Failed to read {member_path} from ZIP: {e}')
+        return None
+
+
+def extract_metadata_from_tar(tf: tarfile.TarFile, member_path: str) -> Optional[PhotoMetadata]:
+    """Extract metadata from a photo inside a TAR archive."""
+    try:
+        member = tf.getmember(member_path)
+        f = tf.extractfile(member)
+        if f:
+            file_data = f.read()
+            f.close()
+            return extract_photo_metadata(file_data, member_path)
+    except Exception as e:
+        logger.debug(f'Failed to read {member_path} from TAR: {e}')
+    return None
+
 
 PARTS_PAT = re.compile(r"^(?P<prefix>.+?)-(?:\d{3,})(?:\.zip|\.tgz|\.tar\.gz)$", re.I)
 
@@ -131,6 +313,112 @@ def save_index(index: Dict[str, Dict[str, float]]) -> None:
     except Exception as e:
         logger.exception(f'Failed to save index: {e}')
 
+
+# --- Discovery tracking helpers ----------------------------------------------
+
+def get_takeout_id(path: Path) -> str:
+    """Generate a unique ID for a takeout source.
+    
+    Uses the absolute path to create a consistent identifier.
+    For multi-part archives, uses the parts_group name.
+    """
+    abs_path = str(path.resolve())
+    # Use first 12 chars of hash for uniqueness while keeping readability
+    hash_suffix = hashlib.md5(abs_path.encode()).hexdigest()[:12]
+    
+    # Get a clean base name
+    if path.is_dir():
+        base = path.name
+    else:
+        base = path.stem
+    
+    # Sanitize for filename
+    safe_base = re.sub(r'[<>:"/\\|?*]', '_', base)
+    return f"{safe_base}_{hash_suffix}"
+
+
+def get_takeout_json_path(path: Path) -> Path:
+    """Get the JSON file path for a takeout discovery."""
+    takeout_id = get_takeout_id(path)
+    return DISCOVERIES_DIR / f"{takeout_id}.takeout_scout"
+
+
+def load_discoveries_index() -> Dict[str, str]:
+    """Load the main discoveries index.
+    
+    Returns a dict mapping source paths to their discovery JSON filenames.
+    """
+    if DISCOVERIES_INDEX_PATH.exists():
+        try:
+            with open(DISCOVERIES_INDEX_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            logger.warning('Discoveries index unreadable; starting fresh.')
+    return {}
+
+
+def save_discoveries_index(index: Dict[str, str]) -> None:
+    """Save the main discoveries index."""
+    try:
+        with open(DISCOVERIES_INDEX_PATH, 'w', encoding='utf-8') as f:
+            json.dump(index, f, indent=2)
+    except Exception as e:
+        logger.exception(f'Failed to save discoveries index: {e}')
+
+
+def load_takeout_discovery(path: Path) -> Optional[TakeoutDiscovery]:
+    """Load an existing takeout discovery record."""
+    json_path = get_takeout_json_path(path)
+    if not json_path.exists():
+        return None
+    
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        return TakeoutDiscovery(
+            source_path=data['source_path'],
+            source_type=data['source_type'],
+            first_discovered=data['first_discovered'],
+            last_scanned=data['last_scanned'],
+            parts_group=data['parts_group'],
+            service_guess=data['service_guess'],
+            file_count=data['file_count'],
+            photos=data['photos'],
+            videos=data['videos'],
+            json_sidecars=data['json_sidecars'],
+            other=data['other'],
+            compressed_size=data['compressed_size'],
+            photos_with_exif=data.get('photos_with_exif', 0),
+            photos_with_gps=data.get('photos_with_gps', 0),
+            photos_with_datetime=data.get('photos_with_datetime', 0),
+            photos_checked=data.get('photos_checked', 0),
+            scan_count=data.get('scan_count', 1),
+            file_details=data.get('file_details', []),
+            notes=data.get('notes', ''),
+        )
+    except Exception as e:
+        logger.exception(f'Failed to load takeout discovery from {json_path}: {e}')
+        return None
+
+
+def save_takeout_discovery(discovery: TakeoutDiscovery) -> None:
+    """Save a takeout discovery record."""
+    json_path = get_takeout_json_path(Path(discovery.source_path))
+    
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(discovery.to_dict(), f, indent=2)
+        
+        # Update the main index
+        index = load_discoveries_index()
+        index[discovery.source_path] = json_path.name
+        save_discoveries_index(index)
+        
+        logger.info(f'Saved takeout discovery: {json_path.name}')
+    except Exception as e:
+        logger.exception(f'Failed to save takeout discovery to {json_path}: {e}')
+
 # --- Data model --------------------------------------------------------------
 
 @dataclass
@@ -144,6 +432,11 @@ class ArchiveSummary:
     json_sidecars: int
     other: int
     compressed_size: int
+    # Metadata statistics
+    photos_with_exif: int = 0
+    photos_with_gps: int = 0
+    photos_with_datetime: int = 0
+    photos_checked: int = 0  # Number of photos we attempted to read metadata from
 
     def to_row(self) -> List[str]:
         return [
@@ -156,6 +449,10 @@ class ArchiveSummary:
             str(self.json_sidecars),
             str(self.other),
             human_size(self.compressed_size),
+            str(self.photos_with_exif),
+            str(self.photos_with_gps),
+            str(self.photos_with_datetime),
+            str(self.photos_checked),
         ]
 
 
@@ -232,20 +529,134 @@ def derive_parts_group(archive_path: Path) -> str:
     return archive_path.stem
 
 
-def scan_archive(path: Path) -> ArchiveSummary:
+def scan_archive(path: Path, save_discovery: bool = True) -> ArchiveSummary:
+    """Scan an archive and optionally save detailed discovery information.
+    
+    Args:
+        path: Path to the archive file
+        save_discovery: If True, saves detailed tracking info to JSON
+    """
     try:
         size = path.stat().st_size
     except Exception:
         size = 0
 
     members: List[str] = []
+    metadata_stats = {'exif': 0, 'gps': 0, 'datetime': 0, 'checked': 0}
+    file_details_list: List[FileDetails] = []
+    
+    # Determine source type
+    if path.suffix.lower() == '.zip':
+        source_type = 'zip'
+    elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
+        source_type = 'tgz'
+    else:
+        source_type = 'unknown'
+    
     try:
         if path.suffix.lower() == '.zip':
             with zipfile.ZipFile(path) as zf:
-                members = list(iter_zip_members(zf))
+                for info in zf.infolist():
+                    if not info.is_dir():
+                        member_path = info.filename
+                        members.append(member_path)
+                        
+                        # Determine file type
+                        ext = Path(member_path).suffix.lower()
+                        if ext in MEDIA_PHOTO_EXT:
+                            file_type = 'photo'
+                        elif ext in MEDIA_VIDEO_EXT:
+                            file_type = 'video'
+                        elif ext in JSON_EXT:
+                            file_type = 'json'
+                        else:
+                            file_type = 'other'
+                        
+                        # Create file detail record
+                        file_detail = FileDetails(
+                            path=member_path,
+                            size=info.file_size,
+                            file_type=file_type,
+                            extension=ext,
+                        )
+                        
+                        # Extract metadata from photo files
+                        if _HAS_PIL and file_type == 'photo':
+                            metadata = extract_metadata_from_zip(zf, member_path)
+                            if metadata:
+                                metadata_stats['checked'] += 1
+                                if metadata.has_exif:
+                                    metadata_stats['exif'] += 1
+                                if metadata.has_gps:
+                                    metadata_stats['gps'] += 1
+                                if metadata.has_datetime:
+                                    metadata_stats['datetime'] += 1
+                                
+                                # Store metadata in file detail
+                                file_detail.metadata = {
+                                    'has_exif': metadata.has_exif,
+                                    'has_gps': metadata.has_gps,
+                                    'has_datetime': metadata.has_datetime,
+                                    'datetime_original': metadata.datetime_original,
+                                    'camera_make': metadata.camera_make,
+                                    'camera_model': metadata.camera_model,
+                                    'width': metadata.width,
+                                    'height': metadata.height,
+                                }
+                        
+                        file_details_list.append(file_detail)
+                        
         elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
             with tarfile.open(path, 'r:*') as tf:
-                members = list(iter_tar_members(tf))
+                for tar_member in tf.getmembers():
+                    if tar_member.isfile():
+                        member_path = tar_member.name.lstrip('./')
+                        members.append(member_path)
+                        
+                        # Determine file type
+                        ext = Path(member_path).suffix.lower()
+                        if ext in MEDIA_PHOTO_EXT:
+                            file_type = 'photo'
+                        elif ext in MEDIA_VIDEO_EXT:
+                            file_type = 'video'
+                        elif ext in JSON_EXT:
+                            file_type = 'json'
+                        else:
+                            file_type = 'other'
+                        
+                        # Create file detail record
+                        file_detail = FileDetails(
+                            path=member_path,
+                            size=tar_member.size,
+                            file_type=file_type,
+                            extension=ext,
+                        )
+                        
+                        # Extract metadata from photo files
+                        if _HAS_PIL and file_type == 'photo':
+                            metadata = extract_metadata_from_tar(tf, member_path)
+                            if metadata:
+                                metadata_stats['checked'] += 1
+                                if metadata.has_exif:
+                                    metadata_stats['exif'] += 1
+                                if metadata.has_gps:
+                                    metadata_stats['gps'] += 1
+                                if metadata.has_datetime:
+                                    metadata_stats['datetime'] += 1
+                                
+                                # Store metadata in file detail
+                                file_detail.metadata = {
+                                    'has_exif': metadata.has_exif,
+                                    'has_gps': metadata.has_gps,
+                                    'has_datetime': metadata.has_datetime,
+                                    'datetime_original': metadata.datetime_original,
+                                    'camera_make': metadata.camera_make,
+                                    'camera_model': metadata.camera_model,
+                                    'width': metadata.width,
+                                    'height': metadata.height,
+                                }
+                        
+                        file_details_list.append(file_detail)
         else:
             logger.warning(f"Skipping unsupported archive: {path}")
             return ArchiveSummary(
@@ -275,9 +686,44 @@ def scan_archive(path: Path) -> ArchiveSummary:
 
     photos, videos, jsons, other = tally_exts(members)
     svc = guess_service_from_members(members)
+    parts_group = derive_parts_group(path)
+    
+    # Save discovery information if requested
+    if save_discovery:
+        try:
+            # Check if this is a rescan
+            existing = load_takeout_discovery(path)
+            now = datetime.now().isoformat()
+            
+            discovery = TakeoutDiscovery(
+                source_path=str(path.resolve()),
+                source_type=source_type,
+                first_discovered=existing.first_discovered if existing else now,
+                last_scanned=now,
+                parts_group=parts_group,
+                service_guess=svc,
+                file_count=len(members),
+                photos=photos,
+                videos=videos,
+                json_sidecars=jsons,
+                other=other,
+                compressed_size=size,
+                photos_with_exif=metadata_stats['exif'],
+                photos_with_gps=metadata_stats['gps'],
+                photos_with_datetime=metadata_stats['datetime'],
+                photos_checked=metadata_stats['checked'],
+                scan_count=(existing.scan_count + 1) if existing else 1,
+                file_details=[fd.to_dict() for fd in file_details_list],
+                notes=existing.notes if existing else '',
+            )
+            
+            save_takeout_discovery(discovery)
+        except Exception as e:
+            logger.exception(f"Failed to save discovery for {path}: {e}")
+    
     return ArchiveSummary(
         path=str(path),
-        parts_group=derive_parts_group(path),
+        parts_group=parts_group,
         service_guess=svc,
         file_count=len(members),
         photos=photos,
@@ -285,27 +731,125 @@ def scan_archive(path: Path) -> ArchiveSummary:
         json_sidecars=jsons,
         other=other,
         compressed_size=size,
+        photos_with_exif=metadata_stats['exif'],
+        photos_with_gps=metadata_stats['gps'],
+        photos_with_datetime=metadata_stats['datetime'],
+        photos_checked=metadata_stats['checked'],
     )
 
 
-def scan_directory(path: Path) -> ArchiveSummary:
-    """Scan an uncompressed directory and return a summary."""
+def scan_directory(path: Path, save_discovery: bool = True) -> ArchiveSummary:
+    """Scan an uncompressed directory and return a summary.
+    
+    Args:
+        path: Path to the directory
+        save_discovery: If True, saves detailed tracking info to JSON
+    """
     try:
         files: List[str] = []
         total_size = 0
+        metadata_stats = {'exif': 0, 'gps': 0, 'datetime': 0, 'checked': 0}
+        file_details_list: List[FileDetails] = []
+        
         for root, _dirs, filenames in os.walk(path):
             for name in filenames:
                 file_path = Path(root) / name
+                file_size = 0
                 try:
-                    total_size += file_path.stat().st_size
+                    file_size = file_path.stat().st_size
+                    total_size += file_size
                 except Exception:
                     pass
+                
                 # Make relative path for service detection
                 rel_path = str(file_path.relative_to(path))
                 files.append(rel_path)
+                
+                # Determine file type
+                ext = file_path.suffix.lower()
+                if ext in MEDIA_PHOTO_EXT:
+                    file_type = 'photo'
+                elif ext in MEDIA_VIDEO_EXT:
+                    file_type = 'video'
+                elif ext in JSON_EXT:
+                    file_type = 'json'
+                else:
+                    file_type = 'other'
+                
+                # Create file detail record
+                file_detail = FileDetails(
+                    path=rel_path,
+                    size=file_size,
+                    file_type=file_type,
+                    extension=ext,
+                )
+                
+                # Extract metadata from photo files
+                if _HAS_PIL and file_type == 'photo':
+                    try:
+                        with open(file_path, 'rb') as f:
+                            file_data = f.read()
+                        metadata = extract_photo_metadata(file_data, name)
+                        if metadata:
+                            metadata_stats['checked'] += 1
+                            if metadata.has_exif:
+                                metadata_stats['exif'] += 1
+                            if metadata.has_gps:
+                                metadata_stats['gps'] += 1
+                            if metadata.has_datetime:
+                                metadata_stats['datetime'] += 1
+                            
+                            # Store metadata in file detail
+                            file_detail.metadata = {
+                                'has_exif': metadata.has_exif,
+                                'has_gps': metadata.has_gps,
+                                'has_datetime': metadata.has_datetime,
+                                'datetime_original': metadata.datetime_original,
+                                'camera_make': metadata.camera_make,
+                                'camera_model': metadata.camera_model,
+                                'width': metadata.width,
+                                'height': metadata.height,
+                            }
+                    except Exception as e:
+                        logger.debug(f'Failed to read metadata from {file_path}: {e}')
+                
+                file_details_list.append(file_detail)
         
         photos, videos, jsons, other = tally_exts(files)
         svc = guess_service_from_members(files)
+        
+        # Save discovery information if requested
+        if save_discovery:
+            try:
+                # Check if this is a rescan
+                existing = load_takeout_discovery(path)
+                now = datetime.now().isoformat()
+                
+                discovery = TakeoutDiscovery(
+                    source_path=str(path.resolve()),
+                    source_type='directory',
+                    first_discovered=existing.first_discovered if existing else now,
+                    last_scanned=now,
+                    parts_group=path.name,
+                    service_guess=svc,
+                    file_count=len(files),
+                    photos=photos,
+                    videos=videos,
+                    json_sidecars=jsons,
+                    other=other,
+                    compressed_size=total_size,
+                    photos_with_exif=metadata_stats['exif'],
+                    photos_with_gps=metadata_stats['gps'],
+                    photos_with_datetime=metadata_stats['datetime'],
+                    photos_checked=metadata_stats['checked'],
+                    scan_count=(existing.scan_count + 1) if existing else 1,
+                    file_details=[fd.to_dict() for fd in file_details_list],
+                    notes=existing.notes if existing else '',
+                )
+                
+                save_takeout_discovery(discovery)
+            except Exception as e:
+                logger.exception(f"Failed to save discovery for {path}: {e}")
         
         return ArchiveSummary(
             path=str(path),
@@ -317,6 +861,10 @@ def scan_directory(path: Path) -> ArchiveSummary:
             json_sidecars=jsons,
             other=other,
             compressed_size=total_size,
+            photos_with_exif=metadata_stats['exif'],
+            photos_with_gps=metadata_stats['gps'],
+            photos_with_datetime=metadata_stats['datetime'],
+            photos_checked=metadata_stats['checked'],
         )
     except Exception as e:
         logger.exception(f"Failed to scan directory {path}: {e}")
@@ -425,7 +973,7 @@ class TakeoutScoutGUI(tk.Tk):
         tree_frame = ttk.Frame(self)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         
-        cols = ('action', 'archive', 'parts', 'service', 'files', 'photos', 'videos', 'json', 'other', 'size')
+        cols = ('action', 'archive', 'parts', 'service', 'files', 'photos', 'videos', 'json', 'other', 'size', 'exif', 'gps', 'datetime', 'checked')
         self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings')
         for key, title, width, minwidth, anchor, stretch in (
             ('action','Action',70,70,tk.CENTER,False),
@@ -438,6 +986,10 @@ class TakeoutScoutGUI(tk.Tk):
             ('json','JSON',60,50,tk.E,False),
             ('other','Other',60,50,tk.E,False),
             ('size','Size',100,80,tk.E,False),
+            ('exif','w/EXIF',60,50,tk.E,False),
+            ('gps','w/GPS',60,50,tk.E,False),
+            ('datetime','w/Date',60,50,tk.E,False),
+            ('checked','Checked',60,50,tk.E,False),
         ):
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, minwidth=minwidth, anchor=anchor, stretch=stretch)
@@ -545,6 +1097,10 @@ class TakeoutScoutGUI(tk.Tk):
             '—',
             '—',
             '—',
+            '—',
+            '—',
+            '—',
+            '—',
         ), tags=('scannable',))
 
     def _show_selected_files(self) -> None:
@@ -563,6 +1119,10 @@ class TakeoutScoutGUI(tk.Tk):
                 str(file_path.name),
                 '(pending scan)',
                 '(pending scan)',
+                '—',
+                '—',
+                '—',
+                '—',
                 '—',
                 '—',
                 '—',
@@ -861,6 +1421,10 @@ class TakeoutScoutGUI(tk.Tk):
                 '—',
                 '—',
                 '—',
+                '—',
+                '—',
+                '—',
+                '—',
             ))
 
     def _populate_tree(self) -> None:
@@ -884,6 +1448,10 @@ class TakeoutScoutGUI(tk.Tk):
                 r.json_sidecars,
                 r.other,
                 human_size(r.compressed_size),
+                r.photos_with_exif,
+                r.photos_with_gps,
+                r.photos_with_datetime,
+                r.photos_checked,
             ))
 
     def on_export(self) -> None:
@@ -902,7 +1470,7 @@ class TakeoutScoutGUI(tk.Tk):
         try:
             with open(dest, 'w', newline='', encoding='utf-8') as f:
                 w = csv.writer(f)
-                w.writerow(['Archive','Parts Group','Service Guess','Files','Photos','Videos','JSON Sidecars','Other','Compressed Size (bytes)'])
+                w.writerow(['Archive','Parts Group','Service Guess','Files','Photos','Videos','JSON Sidecars','Other','Compressed Size (bytes)','Photos w/EXIF','Photos w/GPS','Photos w/DateTime','Photos Checked'])
                 for r in self._rows:
                     w.writerow([
                         Path(r.path).name,
@@ -914,6 +1482,10 @@ class TakeoutScoutGUI(tk.Tk):
                         r.json_sidecars,
                         r.other,
                         r.compressed_size,
+                        r.photos_with_exif,
+                        r.photos_with_gps,
+                        r.photos_with_datetime,
+                        r.photos_checked,
                     ])
             logger.info(f"Exported CSV: {dest}")
             messagebox.showinfo('Export complete', f'CSV saved to:\n{dest}')

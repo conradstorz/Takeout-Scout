@@ -3,3 +3,5 @@
 # Install these for enhanced features:
 
 loguru>=0.7.0  # Enhanced logging with rotation (optional but recommended)
+Pillow>=10.0.0  # For reading photo EXIF metadata
+streamlit>=1.28.0  # For web UI (app.py)
