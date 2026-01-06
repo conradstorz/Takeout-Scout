@@ -15,34 +15,34 @@ License: MIT
 """
 from __future__ import annotations
 
-import hashlib
-import io
 import os
-import re
-import tarfile
-import time
-import zipfile
-from collections import Counter, defaultdict
-from dataclasses import dataclass, asdict
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
 from enum import Enum
+from pathlib import Path
+from typing import List, Optional
 
 import streamlit as st
 import pandas as pd
 
-# --- PIL/Pillow for EXIF metadata (optional) ---------------------------------
-try:
-    from PIL import Image
-    from PIL.ExifTags import TAGS
-    _HAS_PIL = True
-except ImportError:
-    _HAS_PIL = False
+# Import from our package
+from takeout_scout import (
+    ArchiveSummary,
+    scan_archive,
+    scan_directory,
+    find_archives_and_dirs,
+    human_size,
+)
+from takeout_scout.constants import ensure_directories
+from takeout_scout.logging import logger
+
+
+# Ensure directories exist on import
+ensure_directories()
 
 
 # --- File status enum --------------------------------------------------------
 class FileStatus(Enum):
+    """Status of a file during validation and scanning."""
     PENDING = "pending"
     VALID = "valid"
     INVALID = "invalid"
@@ -51,17 +51,26 @@ class FileStatus(Enum):
     ERROR = "error"
 
 
-# --- File info dataclass -----------------------------------------------------
-@dataclass
 class FileInfo:
     """Quick metadata about a file without deep scanning."""
-    path: Path
-    name: str
-    size: int
-    status: FileStatus
-    is_valid: bool
-    error_message: Optional[str] = None
-    file_type: Optional[str] = None  # 'zip', 'tgz', 'directory'
+    
+    def __init__(
+        self,
+        path: Path,
+        name: str,
+        size: int,
+        status: FileStatus,
+        is_valid: bool,
+        error_message: Optional[str] = None,
+        file_type: Optional[str] = None,
+    ) -> None:
+        self.path = path
+        self.name = name
+        self.size = size
+        self.status = status
+        self.is_valid = is_valid
+        self.error_message = error_message
+        self.file_type = file_type
     
     def to_dict(self) -> dict:
         return {
@@ -75,613 +84,36 @@ class FileInfo:
             'file_type': self.file_type,
         }
 
-# --- Logging setup -----------------------------------------------------------
-try:
-    from loguru import logger
-    _HAS_LOGURU = True
-except Exception:
-    import logging
-    
-    class _Shim:
-        def __init__(self) -> None:
-            logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-            self._log = logging.getLogger('takeout_scout')
-        def info(self, msg: str, *a, **kw):
-            self._log.info(msg, *a, **kw)
-        def warning(self, msg: str, *a, **kw):
-            self._log.warning(msg, *a, **kw)
-        def error(self, msg: str, *a, **kw):
-            self._log.error(msg, *a, **kw)
-        def exception(self, msg: str, *a, **kw):
-            self._log.exception(msg, *a, **kw)
-        def debug(self, msg: str, *a, **kw):
-            self._log.debug(msg, *a, **kw)
-    logger = _Shim()
-    _HAS_LOGURU = False
-
-LOG_DIR = Path('logs')
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-if _HAS_LOGURU:
-    logger.add(
-        LOG_DIR / 'takeout_scout.log',
-        rotation='5 MB',
-        retention=5,
-        enqueue=True,
-        backtrace=True,
-        diagnose=False,
-        level='INFO',
-    )
-
-import json
-
-# --- State (persistent index) -----------------------------------------------
-STATE_DIR = Path('state')
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-INDEX_PATH = STATE_DIR / 'takeout_index.json'
-
-# --- Discovery tracking -----------------------------------------------------
-DISCOVERIES_DIR = Path('takeouts_discovered')
-DISCOVERIES_DIR.mkdir(parents=True, exist_ok=True)
-DISCOVERIES_INDEX_PATH = Path('discoveries_index.json')
-
-# --- File type definitions ---------------------------------------------------
-MEDIA_PHOTO_EXT = {
-    '.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp', '.gif', '.bmp', '.tif', '.tiff',
-    '.jfif', '.avif', '.jxl', '.psd', '.svg',
-    '.raw', '.dng', '.arw', '.cr2', '.nef', '.orf', '.rw2', '.pef', '.srw', '.raf',
-}
-MEDIA_VIDEO_EXT = {
-    '.mp4', '.mov', '.m4v', '.avi', '.mts', '.m2ts', '.wmv', '.3gp', '.mkv',
-    '.webm', '.mpg', '.mpeg', '.flv', '.ogv', '.vob', '.ts', '.mxf',
-}
-JSON_EXT = {'.json'}
-
-SERVICE_HINTS = {
-    'Google Photos': re.compile(r'^Takeout/Google Photos/|Google Photos/', re.I),
-    'Google Drive': re.compile(r'^Takeout/Google Drive/|Google Drive/', re.I),
-    'Google Maps': re.compile(r'Maps|Location|Contributions', re.I),
-    'Hangouts/Chat': re.compile(r'Hangouts|Chat', re.I),
-    'Blogger/Album Archive': re.compile(r'Blogger|Album Archive|Picasa', re.I),
-}
-
-PARTS_PAT = re.compile(r"^(?P<prefix>.+?)-(?:\d{3,})(?:\.zip|\.tgz|\.tar\.gz)$", re.I)
-
-# --- Photo metadata helpers --------------------------------------------------
-
-@dataclass
-class PhotoMetadata:
-    """Container for photo EXIF metadata."""
-    has_exif: bool = False
-    has_gps: bool = False
-    has_datetime: bool = False
-    camera_make: Optional[str] = None
-    camera_model: Optional[str] = None
-    datetime_original: Optional[str] = None
-    gps_latitude: Optional[float] = None
-    gps_longitude: Optional[float] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
-
-
-@dataclass
-class FileDetails:
-    """Detailed information about a file within a takeout."""
-    path: str
-    size: int
-    file_type: str  # 'photo', 'video', 'json', 'other'
-    extension: str
-    metadata: Optional[Dict] = None  # EXIF or other metadata
-    
-    def to_dict(self) -> dict:
-        return {
-            'path': self.path,
-            'size': self.size,
-            'file_type': self.file_type,
-            'extension': self.extension,
-            'metadata': self.metadata,
-        }
-
-
-@dataclass
-class MediaPair:
-    """Represents paired files that form a single media entity."""
-    pair_type: str  # 'live_photo', 'motion_photo', 'photo_json'
-    photo_path: str
-    companion_path: str
-    photo_size: int
-    companion_size: int
-    base_name: str
-    
-    def to_dict(self) -> dict:
-        return {
-            'pair_type': self.pair_type,
-            'photo_path': self.photo_path,
-            'companion_path': self.companion_path,
-            'photo_size': self.photo_size,
-            'companion_size': self.companion_size,
-            'base_name': self.base_name,
-        }
-
-
-@dataclass
-class TakeoutDiscovery:
-    """Complete tracking information for a discovered takeout."""
-    source_path: str
-    source_type: str  # 'zip', 'tgz', 'directory'
-    first_discovered: str  # ISO format datetime
-    last_scanned: str  # ISO format datetime
-    parts_group: str
-    service_guess: str
-    file_count: int
-    photos: int
-    videos: int
-    json_sidecars: int
-    other: int
-    compressed_size: int
-    photos_with_exif: int = 0
-    photos_with_gps: int = 0
-    photos_with_datetime: int = 0
-    photos_checked: int = 0
-    live_photos: int = 0
-    motion_photos: int = 0
-    photo_json_pairs: int = 0
-    scan_count: int = 1
-    file_details: List[Dict] = None  # List of FileDetails.to_dict()
-    media_pairs: List[Dict] = None  # List of MediaPair.to_dict()
-    notes: str = ''
-    
-    def __post_init__(self):
-        if self.file_details is None:
-            self.file_details = []
-        if self.media_pairs is None:
-            self.media_pairs = []
-    
-    def to_dict(self) -> dict:
-        return {
-            'source_path': self.source_path,
-            'source_type': self.source_type,
-            'first_discovered': self.first_discovered,
-            'last_scanned': self.last_scanned,
-            'parts_group': self.parts_group,
-            'service_guess': self.service_guess,
-            'file_count': self.file_count,
-            'photos': self.photos,
-            'videos': self.videos,
-            'json_sidecars': self.json_sidecars,
-            'other': self.other,
-            'compressed_size': self.compressed_size,
-            'photos_with_exif': self.photos_with_exif,
-            'photos_with_gps': self.photos_with_gps,
-            'photos_with_datetime': self.photos_with_datetime,
-            'photos_checked': self.photos_checked,
-            'live_photos': self.live_photos,
-            'motion_photos': self.motion_photos,
-            'photo_json_pairs': self.photo_json_pairs,
-            'scan_count': self.scan_count,
-            'file_details': self.file_details,
-            'media_pairs': self.media_pairs,
-            'notes': self.notes,
-        }
-
-
-def extract_photo_metadata(file_data: bytes, filename: str) -> Optional[PhotoMetadata]:
-    """Extract EXIF metadata from photo file bytes.
-    
-    Args:
-        file_data: Raw bytes of the image file
-        filename: Name of the file (for logging)
-    
-    Returns:
-        PhotoMetadata object if extraction succeeds, None otherwise
-    """
-    if not _HAS_PIL:
-        return None
-    
-    try:
-        img = Image.open(io.BytesIO(file_data))
-        metadata = PhotoMetadata()
-        
-        # Get basic dimensions
-        metadata.width = img.width
-        metadata.height = img.height
-        
-        # Try to get EXIF data
-        exif_data = img.getexif()
-        if not exif_data:
-            return metadata
-        
-        metadata.has_exif = True
-        
-        # Extract common EXIF tags
-        for tag_id, value in exif_data.items():
-            tag_name = TAGS.get(tag_id, tag_id)
-            
-            if tag_name == 'Make':
-                metadata.camera_make = str(value).strip()
-            elif tag_name == 'Model':
-                metadata.camera_model = str(value).strip()
-            elif tag_name == 'DateTimeOriginal':
-                metadata.datetime_original = str(value)
-                metadata.has_datetime = True
-            elif tag_name == 'DateTime' and not metadata.datetime_original:
-                metadata.datetime_original = str(value)
-                metadata.has_datetime = True
-            elif tag_name == 'GPSInfo':
-                metadata.has_gps = True
-                # GPS data is complex; just mark presence for now
-        
-        return metadata
-    
-    except Exception as e:
-        logger.debug(f'Failed to extract metadata from {filename}: {e}')
-        return None
-
-
-def extract_metadata_from_zip(zf: zipfile.ZipFile, member_path: str) -> Optional[PhotoMetadata]:
-    """Extract metadata from a photo inside a ZIP archive."""
-    try:
-        with zf.open(member_path) as f:
-            file_data = f.read()
-        return extract_photo_metadata(file_data, member_path)
-    except Exception as e:
-        logger.debug(f'Failed to read {member_path} from ZIP: {e}')
-        return None
-
-
-def extract_metadata_from_tar(tf: tarfile.TarFile, member_path: str) -> Optional[PhotoMetadata]:
-    """Extract metadata from a photo inside a TAR archive."""
-    try:
-        member = tf.getmember(member_path)
-        f = tf.extractfile(member)
-        if f:
-            file_data = f.read()
-            f.close()
-            return extract_photo_metadata(file_data, member_path)
-    except Exception as e:
-        logger.debug(f'Failed to read {member_path} from TAR: {e}')
-    return None
-
-
-def human_size(n: int) -> str:
-    units = ['B', 'KB', 'MB', 'GB', 'TB']
-    size = float(n)
-    for u in units:
-        if size < 1024 or u == 'TB':
-            return f"{size:.2f} {u}"
-        size /= 1024
-    return f"{size:.2f} TB"
-
-
-# --- Index helpers -----------------------------------------------------------
-def load_index() -> Dict[str, Dict[str, float]]:
-    """Load mapping of absolute archive path -> {size, mtime}."""
-    if INDEX_PATH.exists():
-        try:
-            with open(INDEX_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            logger.warning('Index file unreadable; starting fresh.')
-    return {}
-
-
-def save_index(index: Dict[str, Dict[str, float]]) -> None:
-    try:
-        with open(INDEX_PATH, 'w', encoding='utf-8') as f:
-            json.dump(index, f, indent=2)
-    except Exception as e:
-        logger.exception(f'Failed to save index: {e}')
-
-
-# --- Discovery tracking helpers ----------------------------------------------
-
-def get_takeout_id(path: Path) -> str:
-    """Generate a unique ID for a takeout source.
-    
-    Uses the absolute path to create a consistent identifier.
-    For multi-part archives, uses the parts_group name.
-    """
-    abs_path = str(path.resolve())
-    # Use first 12 chars of hash for uniqueness while keeping readability
-    hash_suffix = hashlib.md5(abs_path.encode()).hexdigest()[:12]
-    
-    # Get a clean base name
-    if path.is_dir():
-        base = path.name
-    else:
-        base = path.stem
-    
-    # Sanitize for filename
-    safe_base = re.sub(r'[<>:"/\\|?*]', '_', base)
-    return f"{safe_base}_{hash_suffix}"
-
-
-def get_takeout_json_path(path: Path) -> Path:
-    """Get the JSON file path for a takeout discovery."""
-    takeout_id = get_takeout_id(path)
-    return DISCOVERIES_DIR / f"{takeout_id}.takeout_scout"
-
-
-def load_discoveries_index() -> Dict[str, str]:
-    """Load the main discoveries index.
-    
-    Returns a dict mapping source paths to their discovery JSON filenames.
-    """
-    if DISCOVERIES_INDEX_PATH.exists():
-        try:
-            with open(DISCOVERIES_INDEX_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            logger.warning('Discoveries index unreadable; starting fresh.')
-    return {}
-
-
-def save_discoveries_index(index: Dict[str, str]) -> None:
-    """Save the main discoveries index."""
-    try:
-        with open(DISCOVERIES_INDEX_PATH, 'w', encoding='utf-8') as f:
-            json.dump(index, f, indent=2)
-    except Exception as e:
-        logger.exception(f'Failed to save discoveries index: {e}')
-
-
-def load_takeout_discovery(path: Path) -> Optional[TakeoutDiscovery]:
-    """Load an existing takeout discovery record."""
-    json_path = get_takeout_json_path(path)
-    if not json_path.exists():
-        return None
-    
-    try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        return TakeoutDiscovery(
-            source_path=data['source_path'],
-            source_type=data['source_type'],
-            first_discovered=data['first_discovered'],
-            last_scanned=data['last_scanned'],
-            parts_group=data['parts_group'],
-            service_guess=data['service_guess'],
-            file_count=data['file_count'],
-            photos=data['photos'],
-            videos=data['videos'],
-            json_sidecars=data['json_sidecars'],
-            other=data['other'],
-            compressed_size=data['compressed_size'],
-            photos_with_exif=data.get('photos_with_exif', 0),
-            photos_with_gps=data.get('photos_with_gps', 0),
-            photos_with_datetime=data.get('photos_with_datetime', 0),
-            photos_checked=data.get('photos_checked', 0),
-            live_photos=data.get('live_photos', 0),
-            motion_photos=data.get('motion_photos', 0),
-            photo_json_pairs=data.get('photo_json_pairs', 0),
-            scan_count=data.get('scan_count', 1),
-            file_details=data.get('file_details', []),
-            media_pairs=data.get('media_pairs', []),
-            notes=data.get('notes', ''),
-        )
-    except Exception as e:
-        logger.exception(f'Failed to load takeout discovery from {json_path}: {e}')
-        return None
-
-
-def save_takeout_discovery(discovery: TakeoutDiscovery) -> None:
-    """Save a takeout discovery record."""
-    json_path = get_takeout_json_path(Path(discovery.source_path))
-    
-    try:
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(discovery.to_dict(), f, indent=2)
-        
-        # Update the main index
-        index = load_discoveries_index()
-        index[discovery.source_path] = json_path.name
-        save_discoveries_index(index)
-        
-        logger.info(f'Saved takeout discovery: {json_path.name}')
-    except Exception as e:
-        logger.exception(f'Failed to save takeout discovery to {json_path}: {e}')
-
-
-# --- Data model --------------------------------------------------------------
-@dataclass
-class ArchiveSummary:
-    path: str
-    parts_group: str
-    service_guess: str
-    file_count: int
-    photos: int
-    videos: int
-    json_sidecars: int
-    other: int
-    compressed_size: int
-    # Metadata statistics
-    photos_with_exif: int = 0
-    photos_with_gps: int = 0
-    photos_with_datetime: int = 0
-    photos_checked: int = 0
-    # Paired media statistics
-    live_photos: int = 0
-    motion_photos: int = 0
-    photo_json_pairs: int = 0
-
-    def to_dict(self) -> dict:
-        return {
-            'Path': Path(self.path).name,
-            'Parts Group': self.parts_group,
-            'Service': self.service_guess,
-            'Files': self.file_count,
-            'Photos': self.photos,
-            'Videos': self.videos,
-            'JSON': self.json_sidecars,
-            'Other': self.other,
-            'Size': human_size(self.compressed_size),
-            'w/EXIF': self.photos_with_exif,
-            'w/GPS': self.photos_with_gps,
-            'w/Date': self.photos_with_datetime,
-            'Checked': self.photos_checked,
-            'Live': self.live_photos,
-            'Motion': self.motion_photos,
-            'P+J': self.photo_json_pairs,
-        }
-
-
-# --- Scanner -----------------------------------------------------------------
-def guess_service_from_members(members: Iterable[str]) -> str:
-    joined = '\n'.join(members)
-    for name, pat in SERVICE_HINTS.items():
-        if pat.search(joined):
-            return name
-    return 'Unknown'
-
-
-def iter_zip_members(zf: zipfile.ZipFile) -> Iterable[str]:
-    for i in zf.infolist():
-        if not i.is_dir():
-            yield i.filename
-
-
-def iter_tar_members(tf: tarfile.TarFile) -> Iterable[str]:
-    for m in tf.getmembers():
-        if m.isfile():
-            yield m.name.lstrip('./')
-
-
-def tally_exts(paths: Iterable[str]) -> Tuple[int, int, int, int]:
-    photos = videos = jsons = other = 0
-    for p in paths:
-        ext = Path(p).suffix.lower()
-        if ext in MEDIA_PHOTO_EXT:
-            photos += 1
-        elif ext in MEDIA_VIDEO_EXT:
-            videos += 1
-        elif ext in JSON_EXT:
-            jsons += 1
-        else:
-            other += 1
-    return photos, videos, jsons, other
-
-
-def derive_parts_group(archive_path: Path) -> str:
-    m = PARTS_PAT.match(archive_path.stem)
-    if m:
-        return m.group('prefix')
-    m2 = re.match(r'^(Takeout-\d{8}T\d{6}Z-\w+?)-(?:\d{3,})$', archive_path.stem)
-    if m2:
-        return m2.group(1)
-    return archive_path.stem
-
-
-def detect_media_pairs(files: List[Tuple[str, int]]) -> Tuple[List[MediaPair], Dict[str, str]]:
-    """Detect paired files that represent the same media entity.
-    
-    Args:
-        files: List of (path, size) tuples
-        
-    Returns:
-        Tuple of (list of MediaPair objects, dict mapping path -> pair_type)
-    """
-    # Group files by base name (without extension)
-    by_base: Dict[str, List[Tuple[str, int, str]]] = defaultdict(list)
-    
-    for path, size in files:
-        base_name = Path(path).stem
-        ext = Path(path).suffix.lower()
-        
-        # For .jpg.json or .heic.json, use the base name without the photo extension
-        if ext == '.json' and '.' in base_name:
-            # Remove one level of extension (e.g., photo.jpg.json -> photo)
-            base_name = Path(base_name).stem
-        
-        by_base[base_name].append((path, size, ext))
-    
-    pairs: List[MediaPair] = []
-    paired_files: Dict[str, str] = {}
-    
-    # Check each base name group for paired files
-    for base_name, files in by_base.items():
-        if len(files) < 2:
-            continue
-        
-        # Group by extension
-        by_ext: Dict[str, Tuple[str, int]] = {}
-        for path, size, ext in files:
-            by_ext[ext] = (path, size)
-        
-        # Check for Apple Live Photos (HEIC/JPG + MOV)
-        photo_exts = {'.heic', '.heif', '.jpg', '.jpeg'}
-        video_exts = {'.mov', '.mp4'}
-        
-        photo_ext = next((e for e in photo_exts if e in by_ext), None)
-        video_ext = next((e for e in video_exts if e in by_ext), None)
-        
-        if photo_ext and video_ext:
-            photo_path, photo_size = by_ext[photo_ext]
-            video_path, video_size = by_ext[video_ext]
-            
-            pair = MediaPair(
-                pair_type='live_photo',
-                photo_path=photo_path,
-                companion_path=video_path,
-                photo_size=photo_size,
-                companion_size=video_size,
-                base_name=Path(photo_path).stem,
-            )
-            pairs.append(pair)
-            paired_files[photo_path] = 'live_photo'
-            paired_files[video_path] = 'live_photo_video'
-        
-        # Check for photo + JSON sidecar
-        photo_with_json = None
-        json_sidecar = None
-        
-        for ext in photo_exts:
-            if ext in by_ext:
-                photo_with_json = by_ext[ext]
-                # Look for corresponding .json
-                json_ext = ext + '.json'
-                if json_ext in by_ext or '.json' in by_ext:
-                    json_sidecar = by_ext.get(json_ext) or by_ext.get('.json')
-                    break
-        
-        if photo_with_json and json_sidecar:
-            photo_path, photo_size = photo_with_json
-            json_path, json_size = json_sidecar
-            
-            # Only create pair if not already part of live photo
-            if photo_path not in paired_files:
-                pair = MediaPair(
-                    pair_type='photo_json',
-                    photo_path=photo_path,
-                    companion_path=json_path,
-                    photo_size=photo_size,
-                    companion_size=json_size,
-                    base_name=Path(photo_path).stem,
-                )
-                pairs.append(pair)
-                paired_files[photo_path] = 'photo_json'
-                paired_files[json_path] = 'json_sidecar'
-    
-    return pairs, paired_files
-
-
-def detect_motion_photo_from_exif(metadata: Optional[PhotoMetadata]) -> bool:
-    """Check if a photo is a Motion Photo based on EXIF data.
-    
-    Motion Photos are Samsung/Google's version of Live Photos where the video
-    is embedded in the photo file itself rather than as a separate file.
-    """
-    if not metadata or not metadata.has_exif:
-        return False
-    
-    # This would require checking specific EXIF tags like:
-    # - MotionPhoto (Samsung)
-    # - MicroVideo (Google)
-    # - GCamera (Google Camera)
-    # This is a placeholder for now
-    return False
-
 
 # --- Quick validation functions ----------------------------------------------
+def validate_zip(path: Path) -> bool:
+    """Validate a ZIP file without extracting it."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path, 'r') as zf:
+            infolist = zf.infolist()
+            return len(infolist) > 0
+    except zipfile.BadZipFile:
+        return False
+    except Exception as e:
+        logger.warning(f"ZIP validation error for {path}: {e}")
+        return False
+
+
+def validate_tar(path: Path) -> bool:
+    """Validate a TAR/TGZ file without extracting it."""
+    import tarfile
+    try:
+        with tarfile.open(path, 'r:*') as tf:
+            _ = tf.getmembers()
+            return True
+    except tarfile.TarError:
+        return False
+    except Exception as e:
+        logger.warning(f"TAR validation error for {path}: {e}")
+        return False
+
+
 def validate_and_get_info(path: Path) -> FileInfo:
     """Quickly validate a file and get basic metadata without deep scanning."""
     try:
@@ -698,7 +130,6 @@ def validate_and_get_info(path: Path) -> FileInfo:
         
         size = path.stat().st_size
         
-        # Determine file type
         if path.is_dir():
             return FileInfo(
                 path=path,
@@ -709,7 +140,6 @@ def validate_and_get_info(path: Path) -> FileInfo:
                 file_type='directory'
             )
         
-        # Check if it's a zip file
         if path.suffix.lower() == '.zip':
             is_valid = validate_zip(path)
             return FileInfo(
@@ -722,8 +152,7 @@ def validate_and_get_info(path: Path) -> FileInfo:
                 file_type='zip'
             )
         
-        # Check if it's a tar/tgz file
-        elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
+        if path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
             is_valid = validate_tar(path)
             return FileInfo(
                 path=path,
@@ -735,7 +164,6 @@ def validate_and_get_info(path: Path) -> FileInfo:
                 file_type='tgz'
             )
         
-        # Unsupported file type
         return FileInfo(
             path=path,
             name=path.name,
@@ -759,458 +187,9 @@ def validate_and_get_info(path: Path) -> FileInfo:
         )
 
 
-def validate_zip(path: Path) -> bool:
-    """Validate a ZIP file without extracting it."""
-    try:
-        with zipfile.ZipFile(path, 'r') as zf:
-            # Just verify we can open the ZIP - don't read the full file list
-            # for large archives as it can be slow. Just check the first entry.
-            infolist = zf.infolist()
-            if not infolist:
-                return False  # Empty ZIP
-            # Successfully opened and has at least one file
-            return True
-    except zipfile.BadZipFile:
-        return False
-    except Exception as e:
-        logger.warning(f"ZIP validation error for {path}: {e}")
-        return False
-
-
-def validate_tar(path: Path) -> bool:
-    """Validate a TAR/TGZ file without extracting it."""
-    try:
-        with tarfile.open(path, 'r:*') as tf:
-            # Try to read the member list
-            _ = tf.getmembers()
-            return True
-    except tarfile.TarError:
-        return False
-    except Exception as e:
-        logger.warning(f"TAR validation error for {path}: {e}")
-        return False
-
-
-def scan_archive(path: Path, save_discovery: bool = True) -> ArchiveSummary:
-    """Scan an archive and optionally save detailed discovery information.
-    
-    Args:
-        path: Path to the archive file
-        save_discovery: If True, saves detailed tracking info to JSON
-    """
-    try:
-        size = path.stat().st_size
-    except Exception:
-        size = 0
-
-    members: List[str] = []
-    metadata_stats = {'exif': 0, 'gps': 0, 'datetime': 0, 'checked': 0}
-    file_details_list: List[FileDetails] = []
-    
-    # Determine source type
-    if path.suffix.lower() == '.zip':
-        source_type = 'zip'
-    elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
-        source_type = 'tgz'
-    else:
-        source_type = 'unknown'
-    
-    try:
-        if path.suffix.lower() == '.zip':
-            with zipfile.ZipFile(path) as zf:
-                for info in zf.infolist():
-                    if not info.is_dir():
-                        member_path = info.filename
-                        members.append(member_path)
-                        
-                        # Determine file type
-                        ext = Path(member_path).suffix.lower()
-                        if ext in MEDIA_PHOTO_EXT:
-                            file_type = 'photo'
-                        elif ext in MEDIA_VIDEO_EXT:
-                            file_type = 'video'
-                        elif ext in JSON_EXT:
-                            file_type = 'json'
-                        else:
-                            file_type = 'other'
-                        
-                        # Create file detail record
-                        file_detail = FileDetails(
-                            path=member_path,
-                            size=info.file_size,
-                            file_type=file_type,
-                            extension=ext,
-                        )
-                        
-                        # Extract metadata from photo files
-                        if _HAS_PIL and file_type == 'photo':
-                            metadata = extract_metadata_from_zip(zf, member_path)
-                            if metadata:
-                                metadata_stats['checked'] += 1
-                                if metadata.has_exif:
-                                    metadata_stats['exif'] += 1
-                                if metadata.has_gps:
-                                    metadata_stats['gps'] += 1
-                                if metadata.has_datetime:
-                                    metadata_stats['datetime'] += 1
-                                
-                                # Store metadata in file detail
-                                file_detail.metadata = {
-                                    'has_exif': metadata.has_exif,
-                                    'has_gps': metadata.has_gps,
-                                    'has_datetime': metadata.has_datetime,
-                                    'datetime_original': metadata.datetime_original,
-                                    'camera_make': metadata.camera_make,
-                                    'camera_model': metadata.camera_model,
-                                    'width': metadata.width,
-                                    'height': metadata.height,
-                                }
-                        
-                        file_details_list.append(file_detail)
-                        
-        elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
-            with tarfile.open(path, 'r:*') as tf:
-                for tar_member in tf.getmembers():
-                    if tar_member.isfile():
-                        member_path = tar_member.name.lstrip('./')
-                        members.append(member_path)
-                        
-                        # Determine file type
-                        ext = Path(member_path).suffix.lower()
-                        if ext in MEDIA_PHOTO_EXT:
-                            file_type = 'photo'
-                        elif ext in MEDIA_VIDEO_EXT:
-                            file_type = 'video'
-                        elif ext in JSON_EXT:
-                            file_type = 'json'
-                        else:
-                            file_type = 'other'
-                        
-                        # Create file detail record
-                        file_detail = FileDetails(
-                            path=member_path,
-                            size=tar_member.size,
-                            file_type=file_type,
-                            extension=ext,
-                        )
-                        
-                        # Extract metadata from photo files
-                        if _HAS_PIL and file_type == 'photo':
-                            metadata = extract_metadata_from_tar(tf, member_path)
-                            if metadata:
-                                metadata_stats['checked'] += 1
-                                if metadata.has_exif:
-                                    metadata_stats['exif'] += 1
-                                if metadata.has_gps:
-                                    metadata_stats['gps'] += 1
-                                if metadata.has_datetime:
-                                    metadata_stats['datetime'] += 1
-                                
-                                # Store metadata in file detail
-                                file_detail.metadata = {
-                                    'has_exif': metadata.has_exif,
-                                    'has_gps': metadata.has_gps,
-                                    'has_datetime': metadata.has_datetime,
-                                    'datetime_original': metadata.datetime_original,
-                                    'camera_make': metadata.camera_make,
-                                    'camera_model': metadata.camera_model,
-                                    'width': metadata.width,
-                                    'height': metadata.height,
-                                }
-                        
-                        file_details_list.append(file_detail)
-        else:
-            logger.warning(f"Skipping unsupported archive: {path}")
-            return ArchiveSummary(
-                path=str(path),
-                parts_group=derive_parts_group(path),
-                service_guess='(unsupported)',
-                file_count=0,
-                photos=0,
-                videos=0,
-                json_sidecars=0,
-                other=0,
-                compressed_size=size,
-            )
-    except Exception as e:
-        logger.exception(f"Failed to read archive {path}: {e}")
-        return ArchiveSummary(
-            path=str(path),
-            parts_group=derive_parts_group(path),
-            service_guess='(error)',
-            file_count=0,
-            photos=0,
-            videos=0,
-            json_sidecars=0,
-            other=0,
-            compressed_size=size,
-        )
-
-    photos, videos, jsons, other = tally_exts(members)
-    svc = guess_service_from_members(members)
-    parts_group = derive_parts_group(path)
-    
-    # Detect media pairs (Live Photos, photo+JSON pairs)
-    file_list_for_pairing = [(fd.path, fd.size) for fd in file_details_list]
-    media_pairs, paired_files = detect_media_pairs(file_list_for_pairing)
-    
-    # Count different pair types
-    pair_counts = {'live_photo': 0, 'motion_photo': 0, 'photo_json': 0}
-    for pair in media_pairs:
-        pair_counts[pair.pair_type] = pair_counts.get(pair.pair_type, 0) + 1
-    
-    # Save discovery information if requested
-    if save_discovery:
-        try:
-            # Check if this is a rescan
-            existing = load_takeout_discovery(path)
-            now = datetime.now().isoformat()
-            
-            discovery = TakeoutDiscovery(
-                source_path=str(path.resolve()),
-                source_type=source_type,
-                first_discovered=existing.first_discovered if existing else now,
-                last_scanned=now,
-                parts_group=parts_group,
-                service_guess=svc,
-                file_count=len(members),
-                photos=photos,
-                videos=videos,
-                json_sidecars=jsons,
-                other=other,
-                compressed_size=size,
-                photos_with_exif=metadata_stats['exif'],
-                photos_with_gps=metadata_stats['gps'],
-                photos_with_datetime=metadata_stats['datetime'],
-                photos_checked=metadata_stats['checked'],
-                live_photos=pair_counts['live_photo'],
-                motion_photos=pair_counts['motion_photo'],
-                photo_json_pairs=pair_counts['photo_json'],
-                scan_count=(existing.scan_count + 1) if existing else 1,
-                file_details=[fd.to_dict() for fd in file_details_list],
-                media_pairs=[mp.to_dict() for mp in media_pairs],
-                notes=existing.notes if existing else '',
-            )
-            
-            save_takeout_discovery(discovery)
-        except Exception as e:
-            logger.exception(f"Failed to save discovery for {path}: {e}")
-    
-    return ArchiveSummary(
-        path=str(path),
-        parts_group=parts_group,
-        service_guess=svc,
-        file_count=len(members),
-        photos=photos,
-        videos=videos,
-        json_sidecars=jsons,
-        other=other,
-        compressed_size=size,
-        photos_with_exif=metadata_stats['exif'],
-        photos_with_gps=metadata_stats['gps'],
-        photos_with_datetime=metadata_stats['datetime'],
-        photos_checked=metadata_stats['checked'],
-        live_photos=pair_counts['live_photo'],
-        motion_photos=pair_counts['motion_photo'],
-        photo_json_pairs=pair_counts['photo_json'],
-    )
-
-
-def scan_directory(path: Path, save_discovery: bool = True) -> ArchiveSummary:
-    """Scan an uncompressed directory and return a summary.
-    
-    Args:
-        path: Path to the directory
-        save_discovery: If True, saves detailed tracking info to JSON
-    """
-    try:
-        files: List[str] = []
-        total_size = 0
-        metadata_stats = {'exif': 0, 'gps': 0, 'datetime': 0, 'checked': 0}
-        file_details_list: List[FileDetails] = []
-        
-        for root, _dirs, filenames in os.walk(path):
-            for name in filenames:
-                file_path = Path(root) / name
-                file_size = 0
-                try:
-                    file_size = file_path.stat().st_size
-                    total_size += file_size
-                except Exception:
-                    pass
-                
-                # Make relative path for service detection
-                rel_path = str(file_path.relative_to(path))
-                files.append(rel_path)
-                
-                # Determine file type
-                ext = file_path.suffix.lower()
-                if ext in MEDIA_PHOTO_EXT:
-                    file_type = 'photo'
-                elif ext in MEDIA_VIDEO_EXT:
-                    file_type = 'video'
-                elif ext in JSON_EXT:
-                    file_type = 'json'
-                else:
-                    file_type = 'other'
-                
-                # Create file detail record
-                file_detail = FileDetails(
-                    path=rel_path,
-                    size=file_size,
-                    file_type=file_type,
-                    extension=ext,
-                )
-                
-                # Extract metadata from photo files
-                if _HAS_PIL and file_type == 'photo':
-                    try:
-                        with open(file_path, 'rb') as f:
-                            file_data = f.read()
-                        metadata = extract_photo_metadata(file_data, name)
-                        if metadata:
-                            metadata_stats['checked'] += 1
-                            if metadata.has_exif:
-                                metadata_stats['exif'] += 1
-                            if metadata.has_gps:
-                                metadata_stats['gps'] += 1
-                            if metadata.has_datetime:
-                                metadata_stats['datetime'] += 1
-                            
-                            # Store metadata in file detail
-                            file_detail.metadata = {
-                                'has_exif': metadata.has_exif,
-                                'has_gps': metadata.has_gps,
-                                'has_datetime': metadata.has_datetime,
-                                'datetime_original': metadata.datetime_original,
-                                'camera_make': metadata.camera_make,
-                                'camera_model': metadata.camera_model,
-                                'width': metadata.width,
-                                'height': metadata.height,
-                            }
-                    except Exception as e:
-                        logger.debug(f'Failed to read metadata from {file_path}: {e}')
-                
-                file_details_list.append(file_detail)
-        
-        photos, videos, jsons, other = tally_exts(files)
-        svc = guess_service_from_members(files)
-        
-        # Detect media pairs (Live Photos, photo+JSON pairs)
-        file_list_for_pairing = [(fd.path, fd.size) for fd in file_details_list]
-        media_pairs, paired_files = detect_media_pairs(file_list_for_pairing)
-        
-        # Count different pair types
-        pair_counts = {'live_photo': 0, 'motion_photo': 0, 'photo_json': 0}
-        for pair in media_pairs:
-            pair_counts[pair.pair_type] = pair_counts.get(pair.pair_type, 0) + 1
-        
-        # Save discovery information if requested
-        if save_discovery:
-            try:
-                # Check if this is a rescan
-                existing = load_takeout_discovery(path)
-                now = datetime.now().isoformat()
-                
-                discovery = TakeoutDiscovery(
-                    source_path=str(path.resolve()),
-                    source_type='directory',
-                    first_discovered=existing.first_discovered if existing else now,
-                    last_scanned=now,
-                    parts_group=path.name,
-                    service_guess=svc,
-                    file_count=len(files),
-                    photos=photos,
-                    videos=videos,
-                    json_sidecars=jsons,
-                    other=other,
-                    compressed_size=total_size,
-                    photos_with_exif=metadata_stats['exif'],
-                    photos_with_gps=metadata_stats['gps'],
-                    photos_with_datetime=metadata_stats['datetime'],
-                    photos_checked=metadata_stats['checked'],
-                    live_photos=pair_counts['live_photo'],
-                    motion_photos=pair_counts['motion_photo'],
-                    photo_json_pairs=pair_counts['photo_json'],
-                    scan_count=(existing.scan_count + 1) if existing else 1,
-                    file_details=[fd.to_dict() for fd in file_details_list],
-                    media_pairs=[mp.to_dict() for mp in media_pairs],
-                    notes=existing.notes if existing else '',
-                )
-                
-                save_takeout_discovery(discovery)
-            except Exception as e:
-                logger.exception(f"Failed to save discovery for {path}: {e}")
-        
-        return ArchiveSummary(
-            path=str(path),
-            parts_group=path.name,
-            service_guess=svc,
-            file_count=len(files),
-            photos=photos,
-            videos=videos,
-            json_sidecars=jsons,
-            other=other,
-            compressed_size=total_size,
-            photos_with_exif=metadata_stats['exif'],
-            photos_with_gps=metadata_stats['gps'],
-            photos_with_datetime=metadata_stats['datetime'],
-            photos_checked=metadata_stats['checked'],
-            live_photos=pair_counts['live_photo'],
-            motion_photos=pair_counts['motion_photo'],
-            photo_json_pairs=pair_counts['photo_json'],
-        )
-    except Exception as e:
-        logger.exception(f"Failed to scan directory {path}: {e}")
-        return ArchiveSummary(
-            path=str(path),
-            parts_group=path.name,
-            service_guess='(error)',
-            file_count=0,
-            photos=0,
-            videos=0,
-            json_sidecars=0,
-            other=0,
-            compressed_size=0,
-        )
-
-
-def find_archives_and_dirs(root: Path) -> Tuple[List[Path], List[Path]]:
-    """Find both archives and Takeout directories."""
-    archives: List[Path] = []
-    directories: List[Path] = []
-    
-    if root.is_dir():
-        root_contents = list(root.iterdir())
-        has_takeout_marker = any(
-            'takeout' in item.name.lower() or 
-            item.name in {'Google Photos', 'Google Drive', 'Google Maps'}
-            for item in root_contents if item.is_dir()
-        )
-        
-        if has_takeout_marker:
-            directories.append(root)
-            logger.info(f"Root folder appears to be a Takeout directory: {root}")
-    
-    for dirpath, dirnames, filenames in os.walk(root):
-        current_dir = Path(dirpath)
-        
-        for name in filenames:
-            lower = name.lower()
-            if lower.endswith('.zip') or lower.endswith('.tgz') or lower.endswith('.tar.gz'):
-                archives.append(current_dir / name)
-        
-        if current_dir == root:
-            for dirname in dirnames:
-                subdir = current_dir / dirname
-                if 'takeout' in dirname.lower():
-                    directories.append(subdir)
-    
-    return sorted(archives), sorted(directories)
-
-
-# --- Streamlit App -----------------------------------------------------------
+# --- Main Streamlit App ------------------------------------------------------
 def main():
+    """Main Streamlit application."""
     st.set_page_config(
         page_title="Takeout Scout",
         page_icon="📦",
@@ -1219,7 +198,7 @@ def main():
     )
     
     st.title("📦 Takeout Scout")
-    st.markdown("*Google Takeout Scanner - Analyze your archives without extraction*")
+    st.markdown("*Scan and analyze Google Takeout archives*")
     
     # Initialize session state
     if 'results' not in st.session_state:
@@ -1227,334 +206,139 @@ def main():
     if 'scanned_paths' not in st.session_state:
         st.session_state.scanned_paths = set()
     if 'pending_files' not in st.session_state:
-        st.session_state.pending_files = []  # List of FileInfo objects
+        st.session_state.pending_files = []
     
-    # Sidebar for selection
+    # Sidebar for controls
     with st.sidebar:
-        st.header("Select Source")
+        st.header("📂 Input")
         
-        selection_mode = st.radio(
-            "Choose how to select:",
-            ["Folder", "Files"],
-            help="Select a folder to scan everything inside, or choose specific files"
+        # Folder input
+        folder_path = st.text_input(
+            "Enter folder path",
+            placeholder="/path/to/takeout/folder",
+            help="Path to a folder containing Takeout archives"
         )
         
-        if selection_mode == "Folder":
-            folder_path = st.text_input(
-                "Folder Path",
-                placeholder="Enter folder path or paste from file explorer",
-                help="Paste the full path to a folder containing Takeout archives or data"
-            )
-            
-            if folder_path and st.button("📁 Load Folder", type="primary"):
-                cleaned_path = clean_file_path(folder_path)
-                load_folder(Path(cleaned_path))
-        
-        else:  # Files mode
-            st.info("💡 Enter file paths (one per line) or paste from file explorer")
-            file_paths_text = st.text_area(
-                "File Paths",
-                placeholder="C:\\path\\to\\file1.zip\nC:\\path\\to\\file2.zip",
-                height=150,
-                help="Paste full paths to ZIP or TGZ files, one per line"
-            )
-            
-            if file_paths_text and st.button("📄 Load Files", type="primary"):
-                raw_paths = [line.strip() for line in file_paths_text.split('\n') if line.strip()]
-                cleaned_paths = [clean_file_path(p) for p in raw_paths]
-                load_files([Path(p) for p in cleaned_paths])
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔍 Scan Folder", disabled=not folder_path):
+                process_folder(Path(folder_path))
         
         st.divider()
         
-        # Bulk actions
-        if st.session_state.pending_files:
-            st.subheader("Bulk Actions")
-            if st.button("🔍 Scan All Pending", type="primary", width="stretch"):
-                scan_all_pending()
+        # File input
+        st.subheader("Or enter file paths")
+        file_paths_text = st.text_area(
+            "Enter file paths (one per line)",
+            placeholder="/path/to/archive1.zip\n/path/to/archive2.tgz",
+            help="Enter paths to individual archive files"
+        )
         
+        if st.button("📄 Add Files", disabled=not file_paths_text):
+            paths = [Path(p.strip()) for p in file_paths_text.strip().split('\n') if p.strip()]
+            add_files_to_pending(paths)
+        
+        st.divider()
+        
+        # Export button
         if st.session_state.results:
-            st.success(f"✅ {len(st.session_state.results)} items scanned")
-            
-            if st.button("🔄 Clear All", width="stretch"):
-                st.session_state.results = []
-                st.session_state.scanned_paths = set()
-                st.session_state.pending_files = []
-                st.rerun()
-            
-            if st.button("💾 Export CSV", width="stretch"):
-                export_csv()
-    
-    # Main area - Show pending files and results
-    if st.session_state.pending_files or st.session_state.results:
+            st.header("📊 Export")
+            export_csv()
         
-        # Pending files section
-        if st.session_state.pending_files:
-            st.subheader("📋 Files Ready to Scan")
-            display_file_cards()
-            st.divider()
-        
-        # Scanned results section
-        if st.session_state.results:
-            st.subheader("✅ Scan Results")
-            display_results_table()
+        # Clear button
+        st.divider()
+        if st.button("🗑️ Clear Results"):
+            st.session_state.results = []
+            st.session_state.scanned_paths = set()
+            st.session_state.pending_files = []
+            st.rerun()
     
-    else:
-        show_welcome_screen()
+    # Main content area
+    show_pending_files()
+    show_results()
 
 
-# --- UI Display Functions ----------------------------------------------------
-def display_file_cards():
-    """Display beautiful cards for each pending file."""
-    for idx, file_info in enumerate(st.session_state.pending_files):
+def add_files_to_pending(paths: List[Path]):
+    """Add files to the pending list with validation."""
+    for path in paths:
+        # Skip if already in pending or scanned
+        if str(path) in st.session_state.scanned_paths:
+            continue
+        if any(f.path == path for f in st.session_state.pending_files):
+            continue
+        
+        file_info = validate_and_get_info(path)
+        st.session_state.pending_files.append(file_info)
+    
+    st.rerun()
+
+
+def show_pending_files():
+    """Show the list of pending files with scan buttons."""
+    if not st.session_state.pending_files:
+        return
+    
+    st.header("📋 Pending Files")
+    
+    # Scan All button
+    valid_count = sum(1 for f in st.session_state.pending_files if f.is_valid and f.status != FileStatus.SCANNED)
+    if valid_count > 0:
+        if st.button(f"⚡ Scan All ({valid_count} files)", type="primary"):
+            scan_all_pending()
+    
+    # Show each file
+    for index, file_info in enumerate(st.session_state.pending_files):
         with st.container():
-            # Create a nice border using columns
-            col1, col2, col3 = st.columns([3, 2, 1])
+            col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
             
             with col1:
-                # File name and type
-                icon = get_file_icon(file_info)
-                st.markdown(f"### {icon} {file_info.name}")
-                st.caption(f"`{file_info.path.parent}`")
+                if file_info.status == FileStatus.SCANNED:
+                    st.markdown(f"✅ **{file_info.name}**")
+                elif file_info.status == FileStatus.ERROR:
+                    st.markdown(f"❌ **{file_info.name}**")
+                elif not file_info.is_valid:
+                    st.markdown(f"⚠️ **{file_info.name}**")
+                else:
+                    st.markdown(f"📄 **{file_info.name}**")
             
             with col2:
-                # Status and size info
-                status_color = get_status_color(file_info.status)
-                status_text = get_status_text(file_info)
-                st.markdown(f"**Status:** :{status_color}[{status_text}]")
-                st.markdown(f"**Size:** {human_size(file_info.size)}")
-                st.markdown(f"**Type:** {file_info.file_type or 'Unknown'}")
+                st.text(human_size(file_info.size))
             
             with col3:
-                # Scan button
+                st.text(file_info.file_type or "—")
+            
+            with col4:
                 if file_info.is_valid and file_info.status != FileStatus.SCANNED:
-                    if st.button(f"🔍 Scan", key=f"scan_{idx}", type="primary"):
-                        scan_single_file(idx)
-                elif not file_info.is_valid:
-                    st.error("❌ Invalid")
-                else:
-                    st.success("✅ Done")
-            
-            # Error message if any
-            if file_info.error_message:
-                st.error(f"⚠️ {file_info.error_message}")
-            
-            st.divider()
+                    if st.button("Scan", key=f"scan_{index}"):
+                        scan_single_file(index, file_info)
+                elif file_info.error_message:
+                    st.text(file_info.error_message[:20])
 
 
-def display_results_table():
-    """Display the scanned results in a table."""
-    df = pd.DataFrame([r.to_dict() for r in st.session_state.results])
-    
-    # Display interactive table
-    st.dataframe(
-        df,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Path": st.column_config.TextColumn("Path", width="large"),
-            "Service": st.column_config.TextColumn("Service", width="medium"),
-            "Size": st.column_config.TextColumn("Size", width="small"),
-        }
-    )
-    
-    # Summary stats
-    col1, col2, col3, col4, col5 = st.columns(5)
-    total_files = sum(r.file_count for r in st.session_state.results)
-    total_photos = sum(r.photos for r in st.session_state.results)
-    total_videos = sum(r.videos for r in st.session_state.results)
-    total_json = sum(r.json_sidecars for r in st.session_state.results)
-    total_size = sum(r.compressed_size for r in st.session_state.results)
-    
-    col1.metric("Total Files", f"{total_files:,}")
-    col2.metric("Photos", f"{total_photos:,}")
-    col3.metric("Videos", f"{total_videos:,}")
-    col4.metric("JSON", f"{total_json:,}")
-    col5.metric("Total Size", human_size(total_size))
-
-
-def show_welcome_screen():
-    """Show welcome screen when no files are loaded."""
-    st.info("👈 Select a folder or files from the sidebar to begin")
-    
-    with st.expander("ℹ️ How to use"):
-        st.markdown("""
-        **Folder Mode:**
-        1. Copy a folder path from File Explorer
-        2. Paste it in the 'Folder Path' box
-        3. Click 'Load Folder' to validate files
-        4. Click individual 'Scan' buttons or 'Scan All Pending'
+def scan_single_file(index: int, file_info: FileInfo):
+    """Scan a single file."""
+    try:
+        file_info.status = FileStatus.SCANNING
+        st.session_state.pending_files[index] = file_info
         
-        **Files Mode:**
-        1. Select files in File Explorer
-        2. Shift+Right-Click and choose 'Copy as path'
-        3. Paste into the 'File Paths' box
-        4. Click 'Load Files' to validate
-        5. Click individual 'Scan' buttons or 'Scan All Pending'
-        
-        **Features:**
-        - Instant file validation
-        - Non-destructive scanning (files are never modified)
-        - Detects Google Photos, Drive, Maps, and more
-        - Supports ZIP and TGZ archives
-        - Scans uncompressed Takeout folders
-        - Export results to CSV
-        """)
-
-
-def get_file_icon(file_info: FileInfo) -> str:
-    """Get an appropriate icon for the file type."""
-    if file_info.file_type == 'zip':
-        return '📦'
-    elif file_info.file_type == 'tgz':
-        return '📚'
-    elif file_info.file_type == 'directory':
-        return '📁'
-    else:
-        return '📄'
-
-
-def get_status_color(status: FileStatus) -> str:
-    """Get color for status badge."""
-    if status == FileStatus.VALID:
-        return 'green'
-    elif status == FileStatus.INVALID:
-        return 'red'
-    elif status == FileStatus.SCANNING:
-        return 'orange'
-    elif status == FileStatus.SCANNED:
-        return 'blue'
-    elif status == FileStatus.ERROR:
-        return 'red'
-    else:
-        return 'gray'
-
-
-def get_status_text(file_info: FileInfo) -> str:
-    """Get human-readable status text."""
-    if file_info.status == FileStatus.VALID:
-        return "Valid & Ready"
-    elif file_info.status == FileStatus.INVALID:
-        return "Invalid File"
-    elif file_info.status == FileStatus.SCANNING:
-        return "Scanning..."
-    elif file_info.status == FileStatus.SCANNED:
-        return "Scanned"
-    elif file_info.status == FileStatus.ERROR:
-        return "Error"
-    else:
-        return "Pending"
-
-
-# --- File Loading Functions --------------------------------------------------
-def clean_file_path(path_str: str) -> str:
-    """Clean up a file path string from various sources."""
-    # Remove quotes that Windows adds when you copy as path
-    path_str = path_str.strip()
-    if path_str.startswith('"') and path_str.endswith('"'):
-        path_str = path_str[1:-1]
-    # Also handle single quotes
-    if path_str.startswith("'") and path_str.endswith("'"):
-        path_str = path_str[1:-1]
-    return path_str.strip()
-
-
-def load_folder(folder_path: Path):
-    """Load and validate files from a folder."""
-    if not folder_path.exists():
-        st.error(f"❌ Folder not found: `{folder_path}`")
-        st.caption(f"Resolved path: `{folder_path.resolve()}`")
-        return
-    
-    with st.spinner(f"Loading files from {folder_path.name}..."):
-        archives, directories = find_archives_and_dirs(folder_path)
-        all_items = list(archives) + list(directories)
-        
-        if not all_items:
-            st.warning(f"⚠️ No archives or Takeout directories found in {folder_path}")
-            # Still validate the folder itself
-            file_info = validate_and_get_info(folder_path)
-            st.session_state.pending_files.append(file_info)
-            st.rerun()
-            return
-        
-        # Validate all found files
-        progress_bar = st.progress(0, text=f"Validating 0/{len(all_items)} files...")
-        for i, item in enumerate(all_items, 1):
-            file_info = validate_and_get_info(item)
-            st.session_state.pending_files.append(file_info)
-            progress_bar.progress(i / len(all_items), text=f"Validating {i}/{len(all_items)} files...")
-        
-        progress_bar.empty()
-        st.success(f"✅ Loaded {len(all_items)} files")
-        st.rerun()
-
-
-def load_files(file_paths: List[Path]):
-    """Load and validate individual files."""
-    if not file_paths:
-        st.warning("⚠️ No file paths provided")
-        return
-    
-    valid_count = 0
-    
-    with st.spinner(f"Validating {len(file_paths)} file(s)..."):
-        progress_bar = st.progress(0, text=f"Validating 0/{len(file_paths)} files...")
-        
-        for i, file_path in enumerate(file_paths, 1):
-            # Debug: show what path we're trying to validate
-            logger.info(f"Validating path: {file_path} (exists: {file_path.exists()})")
-            
-            file_info = validate_and_get_info(file_path)
-            st.session_state.pending_files.append(file_info)
-            if file_info.is_valid:
-                valid_count += 1
-            progress_bar.progress(i / len(file_paths), text=f"Validating {i}/{len(file_paths)} files...")
-        
-        progress_bar.empty()
-        
-        if valid_count == 0:
-            st.error(f"❌ No valid files found")
-            # Show the first error for debugging
-            if st.session_state.pending_files:
-                first = st.session_state.pending_files[-len(file_paths)]
-                if first.error_message:
-                    st.caption(f"First error: {first.error_message}")
-                st.caption(f"Path tried: `{first.path}`")
-        elif valid_count < len(file_paths):
-            st.warning(f"⚠️ Loaded {valid_count}/{len(file_paths)} valid files")
-        else:
-            st.success(f"✅ All {valid_count} files are valid")
-        
-        st.rerun()
-
-
-def scan_single_file(index: int):
-    """Scan a single file from the pending list."""
-    file_info = st.session_state.pending_files[index]
-    
-    with st.spinner(f"Scanning {file_info.name}..."):
-        try:
+        with st.spinner(f"Scanning {file_info.name}..."):
             if file_info.file_type == 'directory':
                 summary = scan_directory(file_info.path)
             else:
                 summary = scan_archive(file_info.path)
-            
-            st.session_state.results.append(summary)
-            st.session_state.scanned_paths.add(str(file_info.path))
-            
-            # Update status
-            file_info.status = FileStatus.SCANNED
-            st.session_state.pending_files[index] = file_info
-            
-            st.success(f"✅ Scanned {file_info.name}")
-            st.rerun()
-            
-        except Exception as e:
-            logger.exception(f"Failed to scan {file_info.path}: {e}")
-            file_info.status = FileStatus.ERROR
-            file_info.error_message = str(e)
-            st.session_state.pending_files[index] = file_info
-            st.error(f"❌ Error scanning {file_info.name}: {e}")
+        
+        st.session_state.results.append(summary)
+        st.session_state.scanned_paths.add(str(file_info.path))
+        file_info.status = FileStatus.SCANNED
+        st.session_state.pending_files[index] = file_info
+        st.rerun()
+        
+    except Exception as e:
+        logger.exception(f"Failed to scan {file_info.path}: {e}")
+        file_info.status = FileStatus.ERROR
+        file_info.error_message = str(e)
+        st.session_state.pending_files[index] = file_info
+        st.error(f"❌ Error scanning {file_info.name}: {e}")
 
 
 def scan_all_pending():
@@ -1607,7 +391,6 @@ def process_folder(folder_path: Path):
         
         if total == 0:
             st.warning(f"⚠️ No Takeout archives or directories found in {folder_path}")
-            # Still show the folder with basic stats
             summary = scan_directory(folder_path)
             if summary.file_count > 0:
                 st.session_state.results.append(summary)
@@ -1638,35 +421,69 @@ def process_folder(folder_path: Path):
         st.rerun()
 
 
-def process_files(file_paths: List[Path]):
-    """Process a list of specific files."""
-    valid_files = [f for f in file_paths if f.exists()]
-    
-    if not valid_files:
-        st.error("❌ No valid files found")
+def show_results():
+    """Display scan results in a table."""
+    if not st.session_state.results:
+        st.info("👆 Select a folder or files to scan")
         return
     
-    invalid = len(file_paths) - len(valid_files)
-    if invalid > 0:
-        st.warning(f"⚠️ Skipped {invalid} invalid path(s)")
+    st.header("📊 Results")
     
-    with st.spinner(f"Scanning {len(valid_files)} file(s)..."):
-        progress_bar = st.progress(0, text=f"Scanning 0/{len(valid_files)} files...")
-        
-        for i, file_path in enumerate(valid_files, 1):
-            if str(file_path) not in st.session_state.scanned_paths:
-                if file_path.is_file():
-                    summary = scan_archive(file_path)
-                else:
-                    summary = scan_directory(file_path)
-                st.session_state.results.append(summary)
-                st.session_state.scanned_paths.add(str(file_path))
-            
-            progress_bar.progress(i / len(valid_files), text=f"Scanning {i}/{len(valid_files)} files...")
-        
-        progress_bar.empty()
-        st.success(f"✅ Scanned {len(valid_files)} file(s)")
-        st.rerun()
+    # Summary stats
+    total_files = sum(r.file_count for r in st.session_state.results)
+    total_photos = sum(r.photos for r in st.session_state.results)
+    total_videos = sum(r.videos for r in st.session_state.results)
+    total_size = sum(r.compressed_size for r in st.session_state.results)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Archives", len(st.session_state.results))
+    col2.metric("Total Files", f"{total_files:,}")
+    col3.metric("Photos/Videos", f"{total_photos:,} / {total_videos:,}")
+    col4.metric("Total Size", human_size(total_size))
+    
+    st.divider()
+    
+    # Results table
+    df = pd.DataFrame([r.to_dict() for r in st.session_state.results])
+    
+    # Rename columns for display
+    column_rename = {
+        'path': 'Source',
+        'parts_group': 'Group',
+        'service_guess': 'Service',
+        'file_count': 'Files',
+        'photos': 'Photos',
+        'videos': 'Videos',
+        'json_sidecars': 'JSON',
+        'other': 'Other',
+        'compressed_size': 'Size (bytes)',
+        'photos_with_exif': 'w/EXIF',
+        'photos_with_gps': 'w/GPS',
+        'photos_with_datetime': 'w/Date',
+        'photos_checked': 'Checked',
+        'live_photos': 'Live',
+        'motion_photos': 'Motion',
+        'photo_json_pairs': 'P+JSON',
+    }
+    df = df.rename(columns=column_rename)
+    
+    # Format source column to just show filename
+    df['Source'] = df['Source'].apply(lambda x: Path(x).name)
+    
+    # Add human-readable size
+    if 'Size (bytes)' in df.columns:
+        df['Size'] = df['Size (bytes)'].apply(human_size)
+        cols = list(df.columns)
+        size_idx = cols.index('Size (bytes)')
+        cols.insert(size_idx + 1, cols.pop(cols.index('Size')))
+        df = df[cols]
+    
+    # Display table
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 def export_csv():
@@ -1680,7 +497,7 @@ def export_csv():
     filename = f'takeout_scout_summary_{timestamp}.csv'
     
     csv = df.to_csv(index=False)
-    st.sidebar.download_button(
+    st.download_button(
         label="⬇️ Download CSV",
         data=csv,
         file_name=filename,
