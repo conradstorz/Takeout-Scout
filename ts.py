@@ -99,10 +99,18 @@ DISCOVERIES_INDEX_PATH = Path('discoveries_index.json')
 # --- Simple size helpers -----------------------------------------------------
 
 MEDIA_PHOTO_EXT = {
-    '.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.raw', '.dng', '.arw', '.cr2', '.nef'
+    # Common formats
+    '.jpg', '.jpeg', '.jfif', '.png', '.heic', '.heif', '.webp', '.gif', '.bmp', 
+    '.tif', '.tiff', '.avif', '.jxl',
+    # RAW formats
+    '.raw', '.dng', '.arw', '.cr2', '.cr3', '.nef', '.nrw', '.orf', '.rw2', 
+    '.raf', '.srf', '.sr2', '.pef', '.srw',
+    # Other
+    '.psd', '.svg'
 }
 MEDIA_VIDEO_EXT = {
-    '.mp4', '.mov', '.m4v', '.avi', '.mts', '.m2ts', '.wmv', '.3gp', '.mkv'
+    '.mp4', '.mov', '.m4v', '.avi', '.mts', '.m2ts', '.wmv', '.3gp', '.mkv',
+    '.webm', '.mpg', '.mpeg', '.flv', '.ogv', '.vob', '.ts', '.mxf'
 }
 JSON_EXT = {'.json'}
 
@@ -151,6 +159,28 @@ class FileDetails:
 
 
 @dataclass
+class MediaPair:
+    """Represents paired files that form a single media entity (Live Photos, Motion Photos)."""
+    pair_type: str  # 'live_photo', 'motion_photo', 'photo_json'
+    photo_path: str
+    companion_path: str  # video component or JSON sidecar
+    photo_size: int
+    companion_size: int
+    base_name: str  # Common base name
+    
+    def to_dict(self) -> dict:
+        return {
+            'pair_type': self.pair_type,
+            'photo_path': self.photo_path,
+            'companion_path': self.companion_path,
+            'photo_size': self.photo_size,
+            'companion_size': self.companion_size,
+            'base_name': self.base_name,
+            'total_size': self.photo_size + self.companion_size,
+        }
+
+
+@dataclass
 class TakeoutDiscovery:
     """Complete tracking information for a discovered takeout."""
     source_path: str
@@ -169,13 +199,19 @@ class TakeoutDiscovery:
     photos_with_gps: int = 0
     photos_with_datetime: int = 0
     photos_checked: int = 0
+    live_photos: int = 0  # Apple Live Photos (HEIC+MOV pairs)
+    motion_photos: int = 0  # Google/Samsung Motion Photos
+    photo_json_pairs: int = 0  # Photos with JSON sidecars
     scan_count: int = 1
     file_details: List[Dict] = None  # List of FileDetails.to_dict()
+    media_pairs: List[Dict] = None  # List of MediaPair.to_dict()
     notes: str = ''
     
     def __post_init__(self):
         if self.file_details is None:
             self.file_details = []
+        if self.media_pairs is None:
+            self.media_pairs = []
     
     def to_dict(self) -> dict:
         return {
@@ -195,8 +231,12 @@ class TakeoutDiscovery:
             'photos_with_gps': self.photos_with_gps,
             'photos_with_datetime': self.photos_with_datetime,
             'photos_checked': self.photos_checked,
+            'live_photos': self.live_photos,
+            'motion_photos': self.motion_photos,
+            'photo_json_pairs': self.photo_json_pairs,
             'scan_count': self.scan_count,
             'file_details': self.file_details,
+            'media_pairs': self.media_pairs,
             'notes': self.notes,
         }
 
@@ -278,6 +318,122 @@ def extract_metadata_from_tar(tf: tarfile.TarFile, member_path: str) -> Optional
     except Exception as e:
         logger.debug(f'Failed to read {member_path} from TAR: {e}')
     return None
+
+
+# --- Live Photo / Motion Photo detection ------------------------------------
+
+def detect_media_pairs(file_list: List[Tuple[str, int]]) -> Tuple[List[MediaPair], Dict[str, str]]:
+    """Detect paired files that represent single media entities.
+    
+    Args:
+        file_list: List of (path, size) tuples
+    
+    Returns:
+        Tuple of (list of MediaPair objects, dict of path -> pair_type for paired files)
+    """
+    pairs: List[MediaPair] = []
+    paired_files: Dict[str, str] = {}  # Maps file path to pair type
+    
+    # Build lookup dicts by base name
+    files_by_base: Dict[str, List[Tuple[str, int, str]]] = defaultdict(list)
+    
+    for path, size in file_list:
+        path_obj = Path(path)
+        parent = str(path_obj.parent)
+        name = path_obj.name
+        ext = path_obj.suffix.lower()
+        
+        # Get base name without extension
+        if name.endswith('.json') and not name == '.json':
+            # Handle JSON sidecars like IMG_1234.jpg.json
+            base = name[:-5]  # Remove .json
+        else:
+            base = path_obj.stem
+        
+        full_base = f"{parent}/{base}"
+        files_by_base[full_base].append((path, size, ext))
+    
+    # Look for pairs
+    for base_path, files in files_by_base.items():
+        if len(files) < 2:
+            continue
+        
+        # Group by extension
+        by_ext: Dict[str, Tuple[str, int]] = {}
+        for path, size, ext in files:
+            by_ext[ext] = (path, size)
+        
+        # Check for Apple Live Photos (HEIC/JPG + MOV)
+        photo_exts = {'.heic', '.heif', '.jpg', '.jpeg'}
+        video_exts = {'.mov', '.mp4'}
+        
+        photo_ext = next((e for e in photo_exts if e in by_ext), None)
+        video_ext = next((e for e in video_exts if e in by_ext), None)
+        
+        if photo_ext and video_ext:
+            photo_path, photo_size = by_ext[photo_ext]
+            video_path, video_size = by_ext[video_ext]
+            
+            pair = MediaPair(
+                pair_type='live_photo',
+                photo_path=photo_path,
+                companion_path=video_path,
+                photo_size=photo_size,
+                companion_size=video_size,
+                base_name=Path(photo_path).stem,
+            )
+            pairs.append(pair)
+            paired_files[photo_path] = 'live_photo'
+            paired_files[video_path] = 'live_photo_video'
+        
+        # Check for photo + JSON sidecar
+        photo_with_json = None
+        json_sidecar = None
+        
+        for ext in photo_exts:
+            if ext in by_ext:
+                photo_with_json = by_ext[ext]
+                # Look for corresponding .json
+                json_ext = ext + '.json'
+                if json_ext in by_ext or '.json' in by_ext:
+                    json_sidecar = by_ext.get(json_ext) or by_ext.get('.json')
+                    break
+        
+        if photo_with_json and json_sidecar:
+            photo_path, photo_size = photo_with_json
+            json_path, json_size = json_sidecar
+            
+            # Only create pair if not already part of live photo
+            if photo_path not in paired_files:
+                pair = MediaPair(
+                    pair_type='photo_json',
+                    photo_path=photo_path,
+                    companion_path=json_path,
+                    photo_size=photo_size,
+                    companion_size=json_size,
+                    base_name=Path(photo_path).stem,
+                )
+                pairs.append(pair)
+                paired_files[photo_path] = 'photo_json'
+                paired_files[json_path] = 'json_sidecar'
+    
+    return pairs, paired_files
+
+
+def detect_motion_photo_from_exif(metadata: Optional[PhotoMetadata]) -> bool:
+    """Check if a photo is a Motion Photo based on EXIF data.
+    
+    Motion Photos have video embedded in the same file.
+    """
+    if not metadata or not metadata.has_exif:
+        return False
+    
+    # This would require checking specific EXIF tags like:
+    # - MotionPhoto: 1
+    # - MicroVideo: 1
+    # - etc.
+    # For now, return False - can be enhanced later with actual EXIF parsing
+    return False
 
 
 PARTS_PAT = re.compile(r"^(?P<prefix>.+?)-(?:\d{3,})(?:\.zip|\.tgz|\.tar\.gz)$", re.I)
@@ -393,8 +549,12 @@ def load_takeout_discovery(path: Path) -> Optional[TakeoutDiscovery]:
             photos_with_gps=data.get('photos_with_gps', 0),
             photos_with_datetime=data.get('photos_with_datetime', 0),
             photos_checked=data.get('photos_checked', 0),
+            live_photos=data.get('live_photos', 0),
+            motion_photos=data.get('motion_photos', 0),
+            photo_json_pairs=data.get('photo_json_pairs', 0),
             scan_count=data.get('scan_count', 1),
             file_details=data.get('file_details', []),
+            media_pairs=data.get('media_pairs', []),
             notes=data.get('notes', ''),
         )
     except Exception as e:
@@ -437,6 +597,10 @@ class ArchiveSummary:
     photos_with_gps: int = 0
     photos_with_datetime: int = 0
     photos_checked: int = 0  # Number of photos we attempted to read metadata from
+    # Paired media
+    live_photos: int = 0  # Apple Live Photos (HEIC+MOV pairs)
+    motion_photos: int = 0  # Google/Samsung Motion Photos
+    photo_json_pairs: int = 0  # Photos with JSON sidecars
 
     def to_row(self) -> List[str]:
         return [
@@ -453,6 +617,9 @@ class ArchiveSummary:
             str(self.photos_with_gps),
             str(self.photos_with_datetime),
             str(self.photos_checked),
+            str(self.live_photos),
+            str(self.motion_photos),
+            str(self.photo_json_pairs),
         ]
 
 
@@ -688,6 +855,15 @@ def scan_archive(path: Path, save_discovery: bool = True) -> ArchiveSummary:
     svc = guess_service_from_members(members)
     parts_group = derive_parts_group(path)
     
+    # Detect media pairs (Live Photos, photo+JSON pairs)
+    file_list_for_pairing = [(fd.path, fd.size) for fd in file_details_list]
+    media_pairs, paired_files = detect_media_pairs(file_list_for_pairing)
+    
+    # Count different pair types
+    pair_counts = {'live_photo': 0, 'motion_photo': 0, 'photo_json': 0}
+    for pair in media_pairs:
+        pair_counts[pair.pair_type] = pair_counts.get(pair.pair_type, 0) + 1
+    
     # Save discovery information if requested
     if save_discovery:
         try:
@@ -712,8 +888,12 @@ def scan_archive(path: Path, save_discovery: bool = True) -> ArchiveSummary:
                 photos_with_gps=metadata_stats['gps'],
                 photos_with_datetime=metadata_stats['datetime'],
                 photos_checked=metadata_stats['checked'],
+                live_photos=pair_counts['live_photo'],
+                motion_photos=pair_counts['motion_photo'],
+                photo_json_pairs=pair_counts['photo_json'],
                 scan_count=(existing.scan_count + 1) if existing else 1,
                 file_details=[fd.to_dict() for fd in file_details_list],
+                media_pairs=[mp.to_dict() for mp in media_pairs],
                 notes=existing.notes if existing else '',
             )
             
@@ -735,6 +915,9 @@ def scan_archive(path: Path, save_discovery: bool = True) -> ArchiveSummary:
         photos_with_gps=metadata_stats['gps'],
         photos_with_datetime=metadata_stats['datetime'],
         photos_checked=metadata_stats['checked'],
+        live_photos=pair_counts['live_photo'],
+        motion_photos=pair_counts['motion_photo'],
+        photo_json_pairs=pair_counts['photo_json'],
     )
 
 
@@ -818,6 +1001,15 @@ def scan_directory(path: Path, save_discovery: bool = True) -> ArchiveSummary:
         photos, videos, jsons, other = tally_exts(files)
         svc = guess_service_from_members(files)
         
+        # Detect media pairs (Live Photos, photo+JSON pairs)
+        file_list_for_pairing = [(fd.path, fd.size) for fd in file_details_list]
+        media_pairs, paired_files = detect_media_pairs(file_list_for_pairing)
+        
+        # Count different pair types
+        pair_counts = {'live_photo': 0, 'motion_photo': 0, 'photo_json': 0}
+        for pair in media_pairs:
+            pair_counts[pair.pair_type] = pair_counts.get(pair.pair_type, 0) + 1
+        
         # Save discovery information if requested
         if save_discovery:
             try:
@@ -842,8 +1034,12 @@ def scan_directory(path: Path, save_discovery: bool = True) -> ArchiveSummary:
                     photos_with_gps=metadata_stats['gps'],
                     photos_with_datetime=metadata_stats['datetime'],
                     photos_checked=metadata_stats['checked'],
+                    live_photos=pair_counts['live_photo'],
+                    motion_photos=pair_counts['motion_photo'],
+                    photo_json_pairs=pair_counts['photo_json'],
                     scan_count=(existing.scan_count + 1) if existing else 1,
                     file_details=[fd.to_dict() for fd in file_details_list],
+                    media_pairs=[mp.to_dict() for mp in media_pairs],
                     notes=existing.notes if existing else '',
                 )
                 
@@ -865,6 +1061,9 @@ def scan_directory(path: Path, save_discovery: bool = True) -> ArchiveSummary:
             photos_with_gps=metadata_stats['gps'],
             photos_with_datetime=metadata_stats['datetime'],
             photos_checked=metadata_stats['checked'],
+            live_photos=pair_counts['live_photo'],
+            motion_photos=pair_counts['motion_photo'],
+            photo_json_pairs=pair_counts['photo_json'],
         )
     except Exception as e:
         logger.exception(f"Failed to scan directory {path}: {e}")
@@ -973,7 +1172,7 @@ class TakeoutScoutGUI(tk.Tk):
         tree_frame = ttk.Frame(self)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         
-        cols = ('action', 'archive', 'parts', 'service', 'files', 'photos', 'videos', 'json', 'other', 'size', 'exif', 'gps', 'datetime', 'checked')
+        cols = ('action', 'archive', 'parts', 'service', 'files', 'photos', 'videos', 'json', 'other', 'size', 'exif', 'gps', 'datetime', 'checked', 'live', 'motion', 'pjson')
         self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings')
         for key, title, width, minwidth, anchor, stretch in (
             ('action','Action',70,70,tk.CENTER,False),
@@ -990,6 +1189,9 @@ class TakeoutScoutGUI(tk.Tk):
             ('gps','w/GPS',60,50,tk.E,False),
             ('datetime','w/Date',60,50,tk.E,False),
             ('checked','Checked',60,50,tk.E,False),
+            ('live','Live',50,45,tk.E,False),
+            ('motion','Motion',60,50,tk.E,False),
+            ('pjson','P+J',50,45,tk.E,False),
         ):
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, minwidth=minwidth, anchor=anchor, stretch=stretch)
@@ -1470,7 +1672,7 @@ class TakeoutScoutGUI(tk.Tk):
         try:
             with open(dest, 'w', newline='', encoding='utf-8') as f:
                 w = csv.writer(f)
-                w.writerow(['Archive','Parts Group','Service Guess','Files','Photos','Videos','JSON Sidecars','Other','Compressed Size (bytes)','Photos w/EXIF','Photos w/GPS','Photos w/DateTime','Photos Checked'])
+                w.writerow(['Archive','Parts Group','Service Guess','Files','Photos','Videos','JSON Sidecars','Other','Compressed Size (bytes)','Photos w/EXIF','Photos w/GPS','Photos w/DateTime','Photos Checked','Live Photos','Motion Photos','Photo+JSON'])
                 for r in self._rows:
                     w.writerow([
                         Path(r.path).name,
@@ -1486,6 +1688,9 @@ class TakeoutScoutGUI(tk.Tk):
                         r.photos_with_gps,
                         r.photos_with_datetime,
                         r.photos_checked,
+                        r.live_photos,
+                        r.motion_photos,
+                        r.photo_json_pairs,
                     ])
             logger.info(f"Exported CSV: {dest}")
             messagebox.showinfo('Export complete', f'CSV saved to:\n{dest}')
