@@ -5,7 +5,7 @@ A modular library for scanning and analyzing Google Takeout archives.
 """
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __author__ = "Conrad"
 
 # Re-export main components for convenient imports
@@ -35,6 +35,13 @@ from takeout_scout.metadata import (
     extract_metadata_from_tar,
     detect_media_pairs,
 )
+from takeout_scout.hashing import (
+    calculate_hash,
+    hash_file,
+    hash_zip_member,
+    hash_tar_member,
+    HashIndex,
+)
 from takeout_scout.utils import human_size
 
 __all__ = [
@@ -63,6 +70,12 @@ __all__ = [
     "extract_metadata_from_zip",
     "extract_metadata_from_tar",
     "detect_media_pairs",
+    # Hashing
+    "calculate_hash",
+    "hash_file",
+    "hash_zip_member",
+    "hash_tar_member",
+    "HashIndex",
     # Utils
     "human_size",
 ]

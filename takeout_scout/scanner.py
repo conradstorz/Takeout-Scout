@@ -36,6 +36,11 @@ from takeout_scout.logging import logger
 # Type alias for progress callbacks
 ProgressCallback = Callable[[int], None]
 
+# Import hashing functions lazily to avoid circular imports
+def _get_hash_functions():
+    from takeout_scout.hashing import hash_zip_member, hash_tar_member, hash_file
+    return hash_zip_member, hash_tar_member, hash_file
+
 
 def guess_service_from_members(members: Iterable[str]) -> str:
     """Guess which Google service a takeout contains based on file paths.
@@ -203,7 +208,11 @@ def _process_file_metadata(
     }
 
 
-def scan_archive(path: Path, save_discovery: bool = True) -> ArchiveSummary:
+def scan_archive(
+    path: Path,
+    save_discovery: bool = True,
+    compute_hashes: bool = False,
+) -> ArchiveSummary:
     """Scan an archive and optionally save detailed discovery information.
     
     Supports ZIP (.zip) and TAR (.tgz, .tar.gz) archives.
@@ -211,6 +220,7 @@ def scan_archive(path: Path, save_discovery: bool = True) -> ArchiveSummary:
     Args:
         path: Path to the archive file
         save_discovery: If True, saves detailed tracking info to JSON
+        compute_hashes: If True, calculate content hashes for duplicate detection
         
     Returns:
         ArchiveSummary with aggregate statistics
@@ -238,9 +248,9 @@ def scan_archive(path: Path, save_discovery: bool = True) -> ArchiveSummary:
     
     try:
         if source_type == 'zip':
-            file_details_list, members = _scan_zip_archive(path, metadata_stats)
+            file_details_list, members = _scan_zip_archive(path, metadata_stats, compute_hashes)
         else:
-            file_details_list, members = _scan_tar_archive(path, metadata_stats)
+            file_details_list, members = _scan_tar_archive(path, metadata_stats, compute_hashes)
     
     except Exception as e:
         logger.exception(f"Failed to read archive {path}: {e}")
@@ -294,11 +304,17 @@ def scan_archive(path: Path, save_discovery: bool = True) -> ArchiveSummary:
 
 def _scan_zip_archive(
     path: Path,
-    metadata_stats: Dict[str, int]
+    metadata_stats: Dict[str, int],
+    compute_hashes: bool = False,
 ) -> Tuple[List[FileDetails], List[str]]:
     """Scan a ZIP archive and extract file details."""
     file_details_list: List[FileDetails] = []
     members: List[str] = []
+    
+    # Get hash function if needed
+    hash_zip_member = None
+    if compute_hashes:
+        hash_zip_member, _, _ = _get_hash_functions()
     
     with zipfile.ZipFile(path) as zf:
         for info in zf.infolist():
@@ -317,6 +333,10 @@ def _scan_zip_archive(
                 file_type=file_type,
                 extension=ext,
             )
+            
+            # Calculate hash if requested
+            if compute_hashes and hash_zip_member:
+                file_detail.file_hash = hash_zip_member(zf, member_path)
             
             # Extract metadata from photos
             if has_pil() and file_type == 'photo':
@@ -339,11 +359,17 @@ def _scan_zip_archive(
 
 def _scan_tar_archive(
     path: Path,
-    metadata_stats: Dict[str, int]
+    metadata_stats: Dict[str, int],
+    compute_hashes: bool = False,
 ) -> Tuple[List[FileDetails], List[str]]:
     """Scan a TAR archive and extract file details."""
     file_details_list: List[FileDetails] = []
     members: List[str] = []
+    
+    # Get hash function if needed
+    hash_tar_member = None
+    if compute_hashes:
+        _, hash_tar_member, _ = _get_hash_functions()
     
     with tarfile.open(path, 'r:*') as tf:
         for tar_member in tf.getmembers():
@@ -362,6 +388,10 @@ def _scan_tar_archive(
                 file_type=file_type,
                 extension=ext,
             )
+            
+            # Calculate hash if requested
+            if compute_hashes and hash_tar_member:
+                file_detail.file_hash = hash_tar_member(tf, member_path)
             
             # Extract metadata from photos
             if has_pil() and file_type == 'photo':
@@ -382,7 +412,11 @@ def _scan_tar_archive(
     return file_details_list, members
 
 
-def scan_directory(path: Path, save_discovery: bool = True) -> ArchiveSummary:
+def scan_directory(
+    path: Path,
+    save_discovery: bool = True,
+    compute_hashes: bool = False,
+) -> ArchiveSummary:
     """Scan an uncompressed directory and return a summary.
     
     Recursively walks the directory tree, analyzing all files.
@@ -390,10 +424,16 @@ def scan_directory(path: Path, save_discovery: bool = True) -> ArchiveSummary:
     Args:
         path: Path to the directory
         save_discovery: If True, saves detailed tracking info to JSON
+        compute_hashes: If True, calculate content hashes for duplicate detection
         
     Returns:
         ArchiveSummary with aggregate statistics
     """
+    # Get hash function if needed
+    hash_file_fn = None
+    if compute_hashes:
+        _, _, hash_file_fn = _get_hash_functions()
+    
     try:
         files: List[str] = []
         total_size = 0
@@ -424,6 +464,10 @@ def scan_directory(path: Path, save_discovery: bool = True) -> ArchiveSummary:
                     file_type=file_type,
                     extension=ext,
                 )
+                
+                # Calculate hash if requested
+                if compute_hashes and hash_file_fn:
+                    file_detail.file_hash = hash_file_fn(file_path)
                 
                 # Extract metadata from photos
                 if has_pil() and file_type == 'photo':

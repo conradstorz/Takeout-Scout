@@ -63,12 +63,14 @@ class FileDetails:
         file_type: Category ('photo', 'video', 'json', 'other')
         extension: File extension including dot (e.g., '.jpg')
         metadata: Optional EXIF or other metadata dictionary
+        file_hash: Optional content hash for duplicate detection
     """
     path: str
     size: int
     file_type: str  # 'photo', 'video', 'json', 'other'
     extension: str
     metadata: Optional[Dict[str, Any]] = None
+    file_hash: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -78,6 +80,7 @@ class FileDetails:
             'file_type': self.file_type,
             'extension': self.extension,
             'metadata': self.metadata,
+            'file_hash': self.file_hash,
         }
     
     @classmethod
@@ -89,6 +92,7 @@ class FileDetails:
             file_type=data['file_type'],
             extension=data['extension'],
             metadata=data.get('metadata'),
+            file_hash=data.get('file_hash'),
         )
 
 

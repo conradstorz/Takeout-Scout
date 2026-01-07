@@ -31,9 +31,11 @@ from takeout_scout import (
     scan_directory,
     find_archives_and_dirs,
     human_size,
+    HashIndex,
 )
 from takeout_scout.constants import ensure_directories
 from takeout_scout.logging import logger
+from takeout_scout.discovery import load_takeout_discovery
 
 
 # Ensure directories exist on import
@@ -207,6 +209,10 @@ def main():
         st.session_state.scanned_paths = set()
     if 'pending_files' not in st.session_state:
         st.session_state.pending_files = []
+    if 'compute_hashes' not in st.session_state:
+        st.session_state.compute_hashes = False
+    if 'hash_index' not in st.session_state:
+        st.session_state.hash_index = HashIndex()
     
     # Sidebar for controls
     with st.sidebar:
@@ -240,6 +246,16 @@ def main():
         
         st.divider()
         
+        # Scan options
+        st.header("⚙️ Options")
+        st.session_state.compute_hashes = st.checkbox(
+            "Compute file hashes",
+            value=st.session_state.compute_hashes,
+            help="Calculate MD5 hashes for duplicate detection (slower but enables duplicate analysis)"
+        )
+        
+        st.divider()
+        
         # Export button
         if st.session_state.results:
             st.header("📊 Export")
@@ -251,11 +267,16 @@ def main():
             st.session_state.results = []
             st.session_state.scanned_paths = set()
             st.session_state.pending_files = []
+            st.session_state.hash_index = HashIndex()
             st.rerun()
     
     # Main content area
     show_pending_files()
     show_results()
+    
+    # Show duplicate analysis if hashes were computed
+    if st.session_state.compute_hashes:
+        show_duplicate_analysis()
 
 
 def add_files_to_pending(paths: List[Path]):
@@ -321,16 +342,23 @@ def scan_single_file(index: int, file_info: FileInfo):
         file_info.status = FileStatus.SCANNING
         st.session_state.pending_files[index] = file_info
         
+        compute_hashes = st.session_state.compute_hashes
+        
         with st.spinner(f"Scanning {file_info.name}..."):
             if file_info.file_type == 'directory':
-                summary = scan_directory(file_info.path)
+                summary = scan_directory(file_info.path, compute_hashes=compute_hashes)
             else:
-                summary = scan_archive(file_info.path)
+                summary = scan_archive(file_info.path, compute_hashes=compute_hashes)
         
         st.session_state.results.append(summary)
         st.session_state.scanned_paths.add(str(file_info.path))
         file_info.status = FileStatus.SCANNED
         st.session_state.pending_files[index] = file_info
+        
+        # Update hash index if hashes were computed
+        if compute_hashes:
+            _update_hash_index(file_info.path)
+        
         st.rerun()
         
     except Exception as e:
@@ -339,6 +367,41 @@ def scan_single_file(index: int, file_info: FileInfo):
         file_info.error_message = str(e)
         st.session_state.pending_files[index] = file_info
         st.error(f"❌ Error scanning {file_info.name}: {e}")
+
+
+def _update_hash_index(path: Path):
+    """Update the hash index from scanned file data."""
+    try:
+        discovery = load_takeout_discovery()
+        if discovery is None:
+            return
+        
+        source_name = str(path)
+        
+        # Check both archives and directories for matching path
+        for archive in discovery.archives:
+            if str(archive.path) == source_name:
+                for file_detail in archive.files:
+                    if file_detail.file_hash:
+                        st.session_state.hash_index.add(
+                            file_detail.file_hash,
+                            str(archive.path),
+                            file_detail.path
+                        )
+                return
+        
+        for directory in discovery.directories:
+            if str(directory.path) == source_name:
+                for file_detail in directory.files:
+                    if file_detail.file_hash:
+                        st.session_state.hash_index.add(
+                            file_detail.file_hash,
+                            str(directory.path),
+                            file_detail.path
+                        )
+                return
+    except Exception as e:
+        logger.warning(f"Failed to update hash index: {e}")
 
 
 def scan_all_pending():
@@ -352,19 +415,24 @@ def scan_all_pending():
         st.warning("No files to scan")
         return
     
+    compute_hashes = st.session_state.compute_hashes
     progress_bar = st.progress(0, text=f"Scanning 0/{len(valid_files)} files...")
     
     for count, (index, file_info) in enumerate(valid_files, 1):
         try:
             if file_info.file_type == 'directory':
-                summary = scan_directory(file_info.path)
+                summary = scan_directory(file_info.path, compute_hashes=compute_hashes)
             else:
-                summary = scan_archive(file_info.path)
+                summary = scan_archive(file_info.path, compute_hashes=compute_hashes)
             
             st.session_state.results.append(summary)
             st.session_state.scanned_paths.add(str(file_info.path))
             file_info.status = FileStatus.SCANNED
             st.session_state.pending_files[index] = file_info
+            
+            # Update hash index if hashes were computed
+            if compute_hashes:
+                _update_hash_index(file_info.path)
             
         except Exception as e:
             logger.exception(f"Failed to scan {file_info.path}: {e}")
@@ -385,16 +453,20 @@ def process_folder(folder_path: Path):
         st.error(f"❌ Folder not found: {folder_path}")
         return
     
+    compute_hashes = st.session_state.compute_hashes
+    
     with st.spinner(f"Scanning {folder_path.name}..."):
         archives, directories = find_archives_and_dirs(folder_path)
         total = len(archives) + len(directories)
         
         if total == 0:
             st.warning(f"⚠️ No Takeout archives or directories found in {folder_path}")
-            summary = scan_directory(folder_path)
+            summary = scan_directory(folder_path, compute_hashes=compute_hashes)
             if summary.file_count > 0:
                 st.session_state.results.append(summary)
                 st.session_state.scanned_paths.add(str(folder_path))
+                if compute_hashes:
+                    _update_hash_index(folder_path)
             return
         
         progress_bar = st.progress(0, text=f"Scanning 0/{total} items...")
@@ -402,23 +474,63 @@ def process_folder(folder_path: Path):
         count = 0
         for directory in directories:
             if str(directory) not in st.session_state.scanned_paths:
-                summary = scan_directory(directory)
+                summary = scan_directory(directory, compute_hashes=compute_hashes)
                 st.session_state.results.append(summary)
                 st.session_state.scanned_paths.add(str(directory))
+                if compute_hashes:
+                    _update_hash_index(directory)
             count += 1
             progress_bar.progress(count / total, text=f"Scanning {count}/{total} items...")
         
         for archive in archives:
             if str(archive) not in st.session_state.scanned_paths:
-                summary = scan_archive(archive)
+                summary = scan_archive(archive, compute_hashes=compute_hashes)
                 st.session_state.results.append(summary)
                 st.session_state.scanned_paths.add(str(archive))
+                if compute_hashes:
+                    _update_hash_index(archive)
             count += 1
             progress_bar.progress(count / total, text=f"Scanning {count}/{total} items...")
         
         progress_bar.empty()
         st.success(f"✅ Scanned {total} items from {folder_path.name}")
         st.rerun()
+
+
+def show_duplicate_analysis():
+    """Display duplicate file analysis."""
+    hash_index = st.session_state.hash_index
+    stats = hash_index.get_duplicate_stats()
+    
+    if stats['duplicate_hashes'] == 0:
+        if st.session_state.results:
+            st.info("No duplicates detected in scanned files.")
+        return
+    
+    st.header("🔍 Duplicate Analysis")
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Duplicate Groups", stats['duplicate_hashes'])
+    col2.metric("Duplicate Files", stats['duplicate_files'])
+    col3.metric("Wasted Space", human_size(stats['wasted_bytes']))
+    
+    # Show detailed duplicate list
+    with st.expander("📋 View Duplicate Details", expanded=False):
+        duplicates = hash_index.find_all_duplicates()
+        
+        for i, (file_hash, locations) in enumerate(duplicates.items(), 1):
+            if i > 50:  # Limit display to 50 groups
+                st.info(f"... and {len(duplicates) - 50} more duplicate groups")
+                break
+            
+            # Get file size from first location
+            first_loc = locations[0]
+            
+            st.markdown(f"**Group {i}** ({len(locations)} copies)")
+            for source, path in locations:
+                source_name = Path(source).name
+                st.markdown(f"- `{source_name}` → `{path}`")
+            st.divider()
 
 
 def show_results():
