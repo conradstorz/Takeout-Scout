@@ -446,42 +446,15 @@ def show_results():
     # Results table
     df = pd.DataFrame([r.to_dict() for r in st.session_state.results])
     
-    # Rename columns for display
-    column_rename = {
-        'path': 'Source',
-        'parts_group': 'Group',
-        'service_guess': 'Service',
-        'file_count': 'Files',
-        'photos': 'Photos',
-        'videos': 'Videos',
-        'json_sidecars': 'JSON',
-        'other': 'Other',
-        'compressed_size': 'Size (bytes)',
-        'photos_with_exif': 'w/EXIF',
-        'photos_with_gps': 'w/GPS',
-        'photos_with_datetime': 'w/Date',
-        'photos_checked': 'Checked',
-        'live_photos': 'Live',
-        'motion_photos': 'Motion',
-        'photo_json_pairs': 'P+JSON',
-    }
-    df = df.rename(columns=column_rename)
-    
-    # Format source column to just show filename
-    df['Source'] = df['Source'].apply(lambda x: Path(x).name)
-    
-    # Add human-readable size
-    if 'Size (bytes)' in df.columns:
-        df['Size'] = df['Size (bytes)'].apply(human_size)
-        cols = list(df.columns)
-        size_idx = cols.index('Size (bytes)')
-        cols.insert(size_idx + 1, cols.pop(cols.index('Size')))
-        df = df[cols]
+    # ArchiveSummary.to_dict() already uses display-friendly keys
+    # Just need to format the Path column to show filename only
+    if 'Path' in df.columns:
+        df['Path'] = df['Path'].apply(lambda x: Path(x).name)
     
     # Display table
     st.dataframe(
         df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
