@@ -46,6 +46,16 @@ uv.lock
 logs/
 state/
 *.csv
+takeouts_discovered/
+discoveries_index.json
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Screenshots
+*.jpeg
+*.png
 
 # Test archives (if you add test data)
 test_archives/
