@@ -3,7 +3,7 @@ import json
 import tempfile
 import tarfile
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pytest
@@ -12,6 +12,8 @@ from takeout_scout.sidecar import (
     GeoLocation,
     SidecarMetadata,
     DateAnalysis,
+    DateComparison,
+    DateComparisonSummary,
     parse_sidecar,
     parse_sidecar_from_file,
     parse_sidecar_from_zip,
@@ -341,3 +343,170 @@ class TestDateAnalysis:
         assert d['total_media'] == 100
         assert d['sidecar_coverage'] == 80.0
         assert d['date_recovery_rate'] == 80.0
+
+
+class TestDateComparison:
+    """Tests for DateComparison dataclass."""
+    
+    def test_has_both_true(self):
+        """Test has_both when both dates present."""
+        comp = DateComparison(
+            file_path="test.jpg",
+            exif_date=datetime(2019, 7, 15, 14, 0, 0),
+            sidecar_date=datetime(2019, 7, 15, 14, 0, 0),
+            difference_seconds=0,
+        )
+        assert comp.has_both is True
+    
+    def test_has_both_false_missing_exif(self):
+        """Test has_both when EXIF missing."""
+        comp = DateComparison(
+            file_path="test.jpg",
+            sidecar_date=datetime(2019, 7, 15, 14, 0, 0),
+        )
+        assert comp.has_both is False
+    
+    def test_dates_match_within_tolerance(self):
+        """Test dates_match with small difference."""
+        comp = DateComparison(
+            file_path="test.jpg",
+            exif_date=datetime(2019, 7, 15, 14, 0, 0),
+            sidecar_date=datetime(2019, 7, 15, 14, 0, 1),  # 1 second diff
+            difference_seconds=-1,
+        )
+        assert comp.dates_match is True
+    
+    def test_dates_mismatch(self):
+        """Test dates don't match with large difference."""
+        comp = DateComparison(
+            file_path="test.jpg",
+            exif_date=datetime(2019, 7, 15, 14, 0, 0),
+            sidecar_date=datetime(2019, 7, 15, 15, 0, 0),  # 1 hour diff
+            difference_seconds=3600,
+        )
+        assert comp.dates_match is False
+    
+    def test_status_no_dates(self):
+        """Test status when no dates."""
+        comp = DateComparison(file_path="test.jpg")
+        assert comp.status == "no_dates"
+    
+    def test_status_sidecar_only(self):
+        """Test status when only sidecar date."""
+        comp = DateComparison(
+            file_path="test.jpg",
+            sidecar_date=datetime(2019, 7, 15, 14, 0, 0),
+        )
+        assert comp.status == "sidecar_only"
+    
+    def test_status_exif_only(self):
+        """Test status when only EXIF date."""
+        comp = DateComparison(
+            file_path="test.jpg",
+            exif_date=datetime(2019, 7, 15, 14, 0, 0),
+        )
+        assert comp.status == "exif_only"
+    
+    def test_status_match(self):
+        """Test status when dates match."""
+        comp = DateComparison(
+            file_path="test.jpg",
+            exif_date=datetime(2019, 7, 15, 14, 0, 0),
+            sidecar_date=datetime(2019, 7, 15, 14, 0, 0),
+            difference_seconds=0,
+        )
+        assert comp.status == "match"
+    
+    def test_status_mismatch(self):
+        """Test status when dates mismatch."""
+        comp = DateComparison(
+            file_path="test.jpg",
+            exif_date=datetime(2019, 7, 15, 14, 0, 0),
+            sidecar_date=datetime(2019, 7, 15, 16, 0, 0),
+            difference_seconds=-7200,
+        )
+        assert comp.status == "mismatch"
+    
+    def test_to_dict(self):
+        """Test serialization."""
+        comp = DateComparison(
+            file_path="test.jpg",
+            source="/path/to/archive.zip",
+            exif_date=datetime(2019, 7, 15, 14, 0, 0),
+            sidecar_date=datetime(2019, 7, 15, 14, 0, 0),
+            difference_seconds=0,
+        )
+        d = comp.to_dict()
+        assert d['file_path'] == "test.jpg"
+        assert d['source'] == "/path/to/archive.zip"
+        assert d['status'] == "match"
+
+
+class TestDateComparisonSummary:
+    """Tests for DateComparisonSummary dataclass."""
+    
+    def test_match_rate(self):
+        """Test match_rate calculation."""
+        summary = DateComparisonSummary(
+            total_files=100,
+            with_both_dates=80,
+            matching=72,
+            mismatched=8,
+        )
+        assert summary.match_rate == 90.0  # 72/80 = 90%
+    
+    def test_match_rate_zero_both(self):
+        """Test match_rate with zero comparisons."""
+        summary = DateComparisonSummary(
+            total_files=100,
+            with_both_dates=0,
+        )
+        assert summary.match_rate == 0.0
+    
+    def test_get_mismatches(self):
+        """Test getting sorted mismatches."""
+        comp1 = DateComparison(
+            file_path="a.jpg",
+            exif_date=datetime(2019, 7, 15, 14, 0, 0),
+            sidecar_date=datetime(2019, 7, 15, 15, 0, 0),
+            difference_seconds=-3600,  # 1 hour
+        )
+        comp2 = DateComparison(
+            file_path="b.jpg",
+            exif_date=datetime(2019, 7, 15, 14, 0, 0),
+            sidecar_date=datetime(2019, 7, 15, 21, 0, 0),
+            difference_seconds=-25200,  # 7 hours
+        )
+        comp3 = DateComparison(
+            file_path="c.jpg",
+            exif_date=datetime(2019, 7, 15, 14, 0, 0),
+            sidecar_date=datetime(2019, 7, 15, 14, 0, 0),
+            difference_seconds=0,  # match
+        )
+        
+        summary = DateComparisonSummary(
+            comparisons=[comp1, comp2, comp3],
+        )
+        
+        mismatches = summary.get_mismatches()
+        assert len(mismatches) == 2
+        # Should be sorted by abs(difference), largest first
+        assert mismatches[0].file_path == "b.jpg"
+        assert mismatches[1].file_path == "a.jpg"
+    
+    def test_to_dict(self):
+        """Test serialization."""
+        summary = DateComparisonSummary(
+            total_files=100,
+            with_both_dates=80,
+            matching=70,
+            mismatched=10,
+            exif_only=5,
+            sidecar_only=10,
+            no_dates=5,
+        )
+        
+        d = summary.to_dict()
+        assert d['total_files'] == 100
+        assert d['with_both_dates'] == 80
+        assert d['match_rate'] == 87.5  # 70/80

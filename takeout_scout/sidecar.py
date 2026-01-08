@@ -377,3 +377,106 @@ class DateAnalysis:
             ] if self.date_range else None,
             'missing_dates_count': len(self.missing_dates),
         }
+
+
+@dataclass
+class DateComparison:
+    """Comparison between EXIF and sidecar dates for a single file.
+    
+    Attributes:
+        file_path: Path to the media file
+        exif_date: Date from EXIF metadata (if available)
+        sidecar_date: Date from JSON sidecar (if available)
+        difference_seconds: Difference in seconds (positive = EXIF is later)
+        source: Source archive/directory path
+    """
+    file_path: str
+    exif_date: Optional[datetime] = None
+    sidecar_date: Optional[datetime] = None
+    difference_seconds: Optional[float] = None
+    source: Optional[str] = None
+    
+    @property
+    def has_both(self) -> bool:
+        """True if both EXIF and sidecar dates are available."""
+        return self.exif_date is not None and self.sidecar_date is not None
+    
+    @property
+    def dates_match(self) -> bool:
+        """True if dates are within 1 second of each other."""
+        if not self.has_both:
+            return False
+        return abs(self.difference_seconds or 0) <= 1
+    
+    @property
+    def status(self) -> str:
+        """Human-readable status of the comparison."""
+        if self.exif_date is None and self.sidecar_date is None:
+            return "no_dates"
+        elif self.exif_date is None:
+            return "sidecar_only"
+        elif self.sidecar_date is None:
+            return "exif_only"
+        elif self.dates_match:
+            return "match"
+        else:
+            return "mismatch"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'file_path': self.file_path,
+            'source': self.source,
+            'exif_date': self.exif_date.isoformat() if self.exif_date else None,
+            'sidecar_date': self.sidecar_date.isoformat() if self.sidecar_date else None,
+            'difference_seconds': self.difference_seconds,
+            'status': self.status,
+        }
+
+
+@dataclass  
+class DateComparisonSummary:
+    """Summary of date comparisons across files.
+    
+    Attributes:
+        total_files: Total media files analyzed
+        with_both_dates: Files with both EXIF and sidecar dates
+        matching: Files where dates match (within 1 second)
+        mismatched: Files where dates differ significantly
+        exif_only: Files with only EXIF date
+        sidecar_only: Files with only sidecar date
+        no_dates: Files with neither date
+        comparisons: List of individual comparisons (for mismatches)
+    """
+    total_files: int = 0
+    with_both_dates: int = 0
+    matching: int = 0
+    mismatched: int = 0
+    exif_only: int = 0
+    sidecar_only: int = 0
+    no_dates: int = 0
+    comparisons: List[DateComparison] = field(default_factory=list)
+    
+    @property
+    def match_rate(self) -> float:
+        """Percentage of files with both dates that match."""
+        if self.with_both_dates == 0:
+            return 0.0
+        return (self.matching / self.with_both_dates) * 100
+    
+    def get_mismatches(self, max_results: int = 100) -> List[DateComparison]:
+        """Get files with mismatched dates, sorted by difference."""
+        mismatches = [c for c in self.comparisons if c.status == "mismatch"]
+        mismatches.sort(key=lambda c: abs(c.difference_seconds or 0), reverse=True)
+        return mismatches[:max_results]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'total_files': self.total_files,
+            'with_both_dates': self.with_both_dates,
+            'matching': self.matching,
+            'mismatched': self.mismatched,
+            'exif_only': self.exif_only,
+            'sidecar_only': self.sidecar_only,
+            'no_dates': self.no_dates,
+            'match_rate': self.match_rate,
+        }

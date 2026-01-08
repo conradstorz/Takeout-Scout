@@ -515,6 +515,7 @@ def process_folder(folder_path: Path):
 def show_date_analysis():
     """Display date recovery analysis from JSON sidecars."""
     from datetime import datetime
+    from takeout_scout.sidecar import DateComparison, DateComparisonSummary
     
     # Gather date statistics from all discoveries
     total_media = 0
@@ -524,49 +525,71 @@ def show_date_analysis():
     all_dates = []
     missing_dates = []
     
+    # EXIF vs Sidecar comparison data
+    comparisons = []
+    
     for result in st.session_state.results:
         try:
             discovery = load_takeout_discovery(Path(result.path))
             if not discovery:
                 continue
             
-            # Check archives
-            for archive in discovery.archives:
-                for fd in archive.files:
-                    if fd.file_type in ('photo', 'video'):
-                        total_media += 1
-                        if fd.sidecar_path:
-                            with_sidecar += 1
-                        if fd.photo_taken_time:
-                            with_photo_taken_time += 1
-                            try:
-                                dt = datetime.fromisoformat(fd.photo_taken_time)
-                                all_dates.append(dt)
-                            except ValueError:
-                                pass
-                        elif fd.creation_time:
-                            with_creation_time += 1
-                        else:
-                            missing_dates.append(fd.path)
-            
-            # Check directories
-            for directory in discovery.directories:
-                for fd in directory.files:
-                    if fd.file_type in ('photo', 'video'):
-                        total_media += 1
-                        if fd.sidecar_path:
-                            with_sidecar += 1
-                        if fd.photo_taken_time:
-                            with_photo_taken_time += 1
-                            try:
-                                dt = datetime.fromisoformat(fd.photo_taken_time)
-                                all_dates.append(dt)
-                            except ValueError:
-                                pass
-                        elif fd.creation_time:
-                            with_creation_time += 1
-                        else:
-                            missing_dates.append(fd.path)
+            # Process archives and directories
+            for source_list in [discovery.archives, discovery.directories]:
+                for source in source_list:
+                    for fd in source.files:
+                        if fd.file_type in ('photo', 'video'):
+                            total_media += 1
+                            
+                            # Parse dates
+                            sidecar_dt = None
+                            exif_dt = None
+                            
+                            if fd.sidecar_path:
+                                with_sidecar += 1
+                            
+                            if fd.photo_taken_time:
+                                with_photo_taken_time += 1
+                                try:
+                                    sidecar_dt = datetime.fromisoformat(fd.photo_taken_time)
+                                    all_dates.append(sidecar_dt)
+                                except ValueError:
+                                    pass
+                            elif fd.creation_time:
+                                with_creation_time += 1
+                                try:
+                                    sidecar_dt = datetime.fromisoformat(fd.creation_time)
+                                except ValueError:
+                                    pass
+                            
+                            # Get EXIF date if available
+                            if fd.metadata and fd.metadata.get('datetime_original'):
+                                try:
+                                    exif_str = fd.metadata['datetime_original']
+                                    # EXIF format: "2019:07:15 14:00:05"
+                                    exif_dt = datetime.strptime(exif_str, "%Y:%m:%d %H:%M:%S")
+                                except (ValueError, TypeError):
+                                    pass
+                            
+                            # Create comparison
+                            diff_seconds = None
+                            if exif_dt and sidecar_dt:
+                                # Make both naive for comparison
+                                exif_naive = exif_dt.replace(tzinfo=None) if exif_dt.tzinfo else exif_dt
+                                sidecar_naive = sidecar_dt.replace(tzinfo=None) if sidecar_dt.tzinfo else sidecar_dt
+                                diff_seconds = (exif_naive - sidecar_naive).total_seconds()
+                            
+                            comparison = DateComparison(
+                                file_path=fd.path,
+                                exif_date=exif_dt,
+                                sidecar_date=sidecar_dt,
+                                difference_seconds=diff_seconds,
+                                source=str(source.path),
+                            )
+                            comparisons.append(comparison)
+                            
+                            if not sidecar_dt and not exif_dt:
+                                missing_dates.append(fd.path)
         except Exception:
             continue
     
@@ -593,13 +616,101 @@ def show_date_analysis():
         
         st.markdown(f"**Date Range:** {earliest.strftime('%Y-%m-%d')} to {latest.strftime('%Y-%m-%d')}")
     
+    # EXIF vs Sidecar comparison
+    st.subheader("🔍 EXIF vs Sidecar Comparison")
+    
+    # Calculate comparison stats
+    with_both = sum(1 for c in comparisons if c.has_both)
+    matching = sum(1 for c in comparisons if c.dates_match)
+    mismatched = sum(1 for c in comparisons if c.status == "mismatch")
+    exif_only = sum(1 for c in comparisons if c.status == "exif_only")
+    sidecar_only = sum(1 for c in comparisons if c.status == "sidecar_only")
+    
+    if with_both > 0:
+        match_pct = (matching / with_both * 100)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Both Dates Available", f"{with_both:,}")
+        col2.metric("Matching", f"{matching:,} ({match_pct:.1f}%)")
+        col3.metric("Mismatched", f"{mismatched:,}")
+        col4.metric("EXIF Only / Sidecar Only", f"{exif_only:,} / {sidecar_only:,}")
+        
+        # Show mismatched files
+        if mismatched > 0:
+            mismatches = [c for c in comparisons if c.status == "mismatch"]
+            mismatches.sort(key=lambda c: abs(c.difference_seconds or 0), reverse=True)
+            
+            with st.expander(f"⚠️ {mismatched} files with date mismatches", expanded=False):
+                for comp in mismatches[:50]:
+                    diff_hours = abs(comp.difference_seconds or 0) / 3600
+                    direction = "EXIF later" if (comp.difference_seconds or 0) > 0 else "Sidecar later"
+                    st.markdown(f"**{Path(comp.file_path).name}** - {diff_hours:.1f}h difference ({direction})")
+                    st.text(f"  EXIF: {comp.exif_date}")
+                    st.text(f"  Sidecar: {comp.sidecar_date}")
+                    st.divider()
+                if len(mismatches) > 50:
+                    st.info(f"... and {len(mismatches) - 50} more")
+    else:
+        st.info("No files with both EXIF and sidecar dates to compare")
+    
     # Show files missing dates
     if missing_dates:
-        with st.expander(f"⚠️ {len(missing_dates)} files without recoverable dates", expanded=False):
+        with st.expander(f"⚠️ {len(missing_dates)} files without any recoverable dates", expanded=False):
             for path in missing_dates[:100]:
                 st.text(path)
             if len(missing_dates) > 100:
                 st.info(f"... and {len(missing_dates) - 100} more")
+    
+    # Export button
+    st.divider()
+    _export_date_analysis(comparisons, total_media, all_dates, missing_dates)
+
+
+def _export_date_analysis(comparisons, total_media, all_dates, missing_dates):
+    """Export date analysis to CSV."""
+    from datetime import datetime
+    
+    # Build export data
+    export_rows = []
+    for comp in comparisons:
+        export_rows.append({
+            'file_path': comp.file_path,
+            'source': comp.source,
+            'exif_date': comp.exif_date.isoformat() if comp.exif_date else '',
+            'sidecar_date': comp.sidecar_date.isoformat() if comp.sidecar_date else '',
+            'difference_seconds': comp.difference_seconds if comp.difference_seconds is not None else '',
+            'status': comp.status,
+        })
+    
+    if not export_rows:
+        return
+    
+    df = pd.DataFrame(export_rows)
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Full report
+        csv_full = df.to_csv(index=False)
+        st.download_button(
+            label="📥 Export Full Date Report (CSV)",
+            data=csv_full,
+            file_name=f'date_analysis_full_{timestamp}.csv',
+            mime='text/csv',
+        )
+    
+    with col2:
+        # Mismatches only
+        df_mismatches = df[df['status'] == 'mismatch']
+        if not df_mismatches.empty:
+            csv_mismatches = df_mismatches.to_csv(index=False)
+            st.download_button(
+                label="⚠️ Export Mismatches Only (CSV)",
+                data=csv_mismatches,
+                file_name=f'date_mismatches_{timestamp}.csv',
+                mime='text/csv',
+            )
 
 
 def show_duplicate_analysis():
