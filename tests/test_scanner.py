@@ -6,6 +6,7 @@ import tempfile
 import zipfile
 import tarfile
 import os
+import json
 from pathlib import Path
 
 from takeout_scout.scanner import (
@@ -240,3 +241,98 @@ class TestFindArchivesAndDirs:
         
         assert len(archives) == 0
         assert len(dirs) == 0
+
+
+class TestScanArchiveWithHashes:
+    """Tests for scan_archive with hash computation - via summary stats."""
+    
+    def test_summary_returns_same_count_with_hashes(self, tmp_path):
+        """Test that summary file count is correct with hashes enabled."""
+        zip_path = tmp_path / "test_hashes.zip"
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            zf.writestr('photo.jpg', b'fake jpg data 12345')
+            zf.writestr('photo2.jpg', b'different data')
+        
+        # Scan with and without hashes - should get same counts
+        summary_with = scan_archive(zip_path, compute_hashes=True, save_discovery=False)
+        summary_without = scan_archive(zip_path, compute_hashes=False, save_discovery=False)
+        
+        assert summary_with.file_count == summary_without.file_count == 2
+        assert summary_with.photos == summary_without.photos == 2
+
+
+class TestScanArchiveWithSidecars:
+    """Tests for scan_archive with sidecar parsing - via summary stats."""
+    
+    def test_sidecar_detection_counts(self, tmp_path):
+        """Test that sidecar counts are correct."""
+        zip_path = tmp_path / "test_sidecars.zip"
+        sidecar_data = {"title": "photo.jpg", "photoTakenTime": {"timestamp": "1609459200"}}
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            zf.writestr('photo.jpg', b'fake jpg data')
+            zf.writestr('photo.jpg.json', json.dumps(sidecar_data))
+            zf.writestr('video.mp4', b'fake video')
+            zf.writestr('video.mp4.json', json.dumps({"title": "video.mp4"}))
+        
+        summary = scan_archive(zip_path, parse_sidecars=True, save_discovery=False)
+        
+        assert summary.photos == 1
+        assert summary.videos == 1
+        assert summary.json_sidecars == 2
+        assert summary.photo_json_pairs >= 1  # At least the photo has a pair
+
+
+class TestScanDirectoryWithHashes:
+    """Tests for scan_directory with hash computation - via summary stats."""
+    
+    def test_directory_scan_counts_with_hashes(self, tmp_path):
+        """Test that directory scan counts are correct with hashes."""
+        (tmp_path / "photo.jpg").write_bytes(b'test image data')
+        (tmp_path / "video.mp4").write_bytes(b'test video data')
+        
+        summary = scan_directory(tmp_path, compute_hashes=True, save_discovery=False)
+        
+        assert summary.file_count == 2
+        assert summary.photos == 1
+        assert summary.videos == 1
+
+
+class TestScanDirectoryWithSidecars:
+    """Tests for scan_directory with sidecar parsing - via summary stats."""
+    
+    def test_directory_sidecar_pair_count(self, tmp_path):
+        """Test that sidecar pairs are counted in directory scan."""
+        sidecar_data = {"title": "photo.jpg", "photoTakenTime": {"timestamp": "1609459200"}}
+        (tmp_path / "photo.jpg").write_bytes(b'test image')
+        (tmp_path / "photo.jpg.json").write_text(json.dumps(sidecar_data))
+        
+        summary = scan_directory(tmp_path, parse_sidecars=True, save_discovery=False)
+        
+        assert summary.photos == 1
+        assert summary.json_sidecars == 1
+        assert summary.photo_json_pairs == 1
+
+
+class TestScanTarWithOptions:
+    """Tests for TAR archive scanning with options."""
+    
+    def test_tar_scan_counts(self, tmp_path):
+        """Test TAR scanning produces correct counts."""
+        import io
+        tgz_path = tmp_path / "test.tgz"
+        with tarfile.open(tgz_path, 'w:gz') as tf:
+            data = b'test image content'
+            info = tarfile.TarInfo(name='photo.jpg')
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+            
+            video_data = b'test video content'
+            video_info = tarfile.TarInfo(name='video.mp4')
+            video_info.size = len(video_data)
+            tf.addfile(video_info, io.BytesIO(video_data))
+        
+        summary = scan_archive(tgz_path, compute_hashes=True, save_discovery=False)
+        
+        assert summary.file_count == 2
+        assert summary.photos == 1
+        assert summary.videos == 1
