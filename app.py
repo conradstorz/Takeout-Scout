@@ -213,6 +213,8 @@ def main():
         st.session_state.compute_hashes = False
     if 'hash_index' not in st.session_state:
         st.session_state.hash_index = HashIndex()
+    if 'parse_sidecars' not in st.session_state:
+        st.session_state.parse_sidecars = True  # Default on since it's so useful
     
     # Sidebar for controls
     with st.sidebar:
@@ -248,6 +250,11 @@ def main():
         
         # Scan options
         st.header("⚙️ Options")
+        st.session_state.parse_sidecars = st.checkbox(
+            "Parse JSON sidecars",
+            value=st.session_state.parse_sidecars,
+            help="Extract authoritative timestamps from Google Photos JSON files (recommended)"
+        )
         st.session_state.compute_hashes = st.checkbox(
             "Compute file hashes",
             value=st.session_state.compute_hashes,
@@ -268,11 +275,16 @@ def main():
             st.session_state.scanned_paths = set()
             st.session_state.pending_files = []
             st.session_state.hash_index = HashIndex()
+            st.session_state.parse_sidecars = True
             st.rerun()
     
     # Main content area
     show_pending_files()
     show_results()
+    
+    # Show date analysis if sidecars were parsed
+    if st.session_state.parse_sidecars and st.session_state.results:
+        show_date_analysis()
     
     # Show duplicate analysis if hashes were computed
     if st.session_state.compute_hashes:
@@ -343,12 +355,13 @@ def scan_single_file(index: int, file_info: FileInfo):
         st.session_state.pending_files[index] = file_info
         
         compute_hashes = st.session_state.compute_hashes
+        parse_sidecars = st.session_state.parse_sidecars
         
         with st.spinner(f"Scanning {file_info.name}..."):
             if file_info.file_type == 'directory':
-                summary = scan_directory(file_info.path, compute_hashes=compute_hashes)
+                summary = scan_directory(file_info.path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
             else:
-                summary = scan_archive(file_info.path, compute_hashes=compute_hashes)
+                summary = scan_archive(file_info.path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
         
         st.session_state.results.append(summary)
         st.session_state.scanned_paths.add(str(file_info.path))
@@ -416,14 +429,15 @@ def scan_all_pending():
         return
     
     compute_hashes = st.session_state.compute_hashes
+    parse_sidecars = st.session_state.parse_sidecars
     progress_bar = st.progress(0, text=f"Scanning 0/{len(valid_files)} files...")
     
     for count, (index, file_info) in enumerate(valid_files, 1):
         try:
             if file_info.file_type == 'directory':
-                summary = scan_directory(file_info.path, compute_hashes=compute_hashes)
+                summary = scan_directory(file_info.path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
             else:
-                summary = scan_archive(file_info.path, compute_hashes=compute_hashes)
+                summary = scan_archive(file_info.path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
             
             st.session_state.results.append(summary)
             st.session_state.scanned_paths.add(str(file_info.path))
@@ -454,6 +468,7 @@ def process_folder(folder_path: Path):
         return
     
     compute_hashes = st.session_state.compute_hashes
+    parse_sidecars = st.session_state.parse_sidecars
     
     with st.spinner(f"Scanning {folder_path.name}..."):
         archives, directories = find_archives_and_dirs(folder_path)
@@ -461,7 +476,7 @@ def process_folder(folder_path: Path):
         
         if total == 0:
             st.warning(f"⚠️ No Takeout archives or directories found in {folder_path}")
-            summary = scan_directory(folder_path, compute_hashes=compute_hashes)
+            summary = scan_directory(folder_path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
             if summary.file_count > 0:
                 st.session_state.results.append(summary)
                 st.session_state.scanned_paths.add(str(folder_path))
@@ -474,7 +489,7 @@ def process_folder(folder_path: Path):
         count = 0
         for directory in directories:
             if str(directory) not in st.session_state.scanned_paths:
-                summary = scan_directory(directory, compute_hashes=compute_hashes)
+                summary = scan_directory(directory, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
                 st.session_state.results.append(summary)
                 st.session_state.scanned_paths.add(str(directory))
                 if compute_hashes:
@@ -484,7 +499,7 @@ def process_folder(folder_path: Path):
         
         for archive in archives:
             if str(archive) not in st.session_state.scanned_paths:
-                summary = scan_archive(archive, compute_hashes=compute_hashes)
+                summary = scan_archive(archive, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
                 st.session_state.results.append(summary)
                 st.session_state.scanned_paths.add(str(archive))
                 if compute_hashes:
@@ -495,6 +510,96 @@ def process_folder(folder_path: Path):
         progress_bar.empty()
         st.success(f"✅ Scanned {total} items from {folder_path.name}")
         st.rerun()
+
+
+def show_date_analysis():
+    """Display date recovery analysis from JSON sidecars."""
+    from datetime import datetime
+    
+    # Gather date statistics from all discoveries
+    total_media = 0
+    with_sidecar = 0
+    with_photo_taken_time = 0
+    with_creation_time = 0
+    all_dates = []
+    missing_dates = []
+    
+    for result in st.session_state.results:
+        try:
+            discovery = load_takeout_discovery(Path(result.path))
+            if not discovery:
+                continue
+            
+            # Check archives
+            for archive in discovery.archives:
+                for fd in archive.files:
+                    if fd.file_type in ('photo', 'video'):
+                        total_media += 1
+                        if fd.sidecar_path:
+                            with_sidecar += 1
+                        if fd.photo_taken_time:
+                            with_photo_taken_time += 1
+                            try:
+                                dt = datetime.fromisoformat(fd.photo_taken_time)
+                                all_dates.append(dt)
+                            except ValueError:
+                                pass
+                        elif fd.creation_time:
+                            with_creation_time += 1
+                        else:
+                            missing_dates.append(fd.path)
+            
+            # Check directories
+            for directory in discovery.directories:
+                for fd in directory.files:
+                    if fd.file_type in ('photo', 'video'):
+                        total_media += 1
+                        if fd.sidecar_path:
+                            with_sidecar += 1
+                        if fd.photo_taken_time:
+                            with_photo_taken_time += 1
+                            try:
+                                dt = datetime.fromisoformat(fd.photo_taken_time)
+                                all_dates.append(dt)
+                            except ValueError:
+                                pass
+                        elif fd.creation_time:
+                            with_creation_time += 1
+                        else:
+                            missing_dates.append(fd.path)
+        except Exception:
+            continue
+    
+    if total_media == 0:
+        return
+    
+    st.header("📅 Date Analysis")
+    
+    # Calculate coverage percentages
+    sidecar_pct = (with_sidecar / total_media * 100) if total_media else 0
+    date_recovery_pct = ((with_photo_taken_time + with_creation_time) / total_media * 100) if total_media else 0
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Media", f"{total_media:,}")
+    col2.metric("With Sidecar", f"{with_sidecar:,} ({sidecar_pct:.1f}%)")
+    col3.metric("Date Recoverable", f"{with_photo_taken_time + with_creation_time:,} ({date_recovery_pct:.1f}%)")
+    col4.metric("Missing Dates", f"{len(missing_dates):,}")
+    
+    # Date range if we have dates
+    if all_dates:
+        all_dates.sort()
+        earliest = all_dates[0]
+        latest = all_dates[-1]
+        
+        st.markdown(f"**Date Range:** {earliest.strftime('%Y-%m-%d')} to {latest.strftime('%Y-%m-%d')}")
+    
+    # Show files missing dates
+    if missing_dates:
+        with st.expander(f"⚠️ {len(missing_dates)} files without recoverable dates", expanded=False):
+            for path in missing_dates[:100]:
+                st.text(path)
+            if len(missing_dates) > 100:
+                st.info(f"... and {len(missing_dates) - 100} more")
 
 
 def show_duplicate_analysis():

@@ -42,6 +42,17 @@ def _get_hash_functions():
     return hash_zip_member, hash_tar_member, hash_file
 
 
+def _get_sidecar_functions():
+    """Import sidecar functions lazily to avoid circular imports."""
+    from takeout_scout.sidecar import (
+        parse_sidecar_from_zip,
+        parse_sidecar_from_tar,
+        parse_sidecar_from_file,
+        find_sidecar_for_media,
+    )
+    return parse_sidecar_from_zip, parse_sidecar_from_tar, parse_sidecar_from_file, find_sidecar_for_media
+
+
 def guess_service_from_members(members: Iterable[str]) -> str:
     """Guess which Google service a takeout contains based on file paths.
     
@@ -212,6 +223,7 @@ def scan_archive(
     path: Path,
     save_discovery: bool = True,
     compute_hashes: bool = False,
+    parse_sidecars: bool = False,
 ) -> ArchiveSummary:
     """Scan an archive and optionally save detailed discovery information.
     
@@ -221,6 +233,7 @@ def scan_archive(
         path: Path to the archive file
         save_discovery: If True, saves detailed tracking info to JSON
         compute_hashes: If True, calculate content hashes for duplicate detection
+        parse_sidecars: If True, parse JSON sidecars to extract authoritative timestamps
         
     Returns:
         ArchiveSummary with aggregate statistics
@@ -248,9 +261,9 @@ def scan_archive(
     
     try:
         if source_type == 'zip':
-            file_details_list, members = _scan_zip_archive(path, metadata_stats, compute_hashes)
+            file_details_list, members = _scan_zip_archive(path, metadata_stats, compute_hashes, parse_sidecars)
         else:
-            file_details_list, members = _scan_tar_archive(path, metadata_stats, compute_hashes)
+            file_details_list, members = _scan_tar_archive(path, metadata_stats, compute_hashes, parse_sidecars)
     
     except Exception as e:
         logger.exception(f"Failed to read archive {path}: {e}")
@@ -306,6 +319,7 @@ def _scan_zip_archive(
     path: Path,
     metadata_stats: Dict[str, int],
     compute_hashes: bool = False,
+    parse_sidecars: bool = False,
 ) -> Tuple[List[FileDetails], List[str]]:
     """Scan a ZIP archive and extract file details."""
     file_details_list: List[FileDetails] = []
@@ -316,13 +330,27 @@ def _scan_zip_archive(
     if compute_hashes:
         hash_zip_member, _, _ = _get_hash_functions()
     
+    # Get sidecar functions if needed
+    parse_sidecar_from_zip = None
+    find_sidecar_for_media = None
+    if parse_sidecars:
+        parse_sidecar_from_zip, _, _, find_sidecar_for_media = _get_sidecar_functions()
+    
     with zipfile.ZipFile(path) as zf:
+        # First pass: collect all member paths
+        for info in zf.infolist():
+            if not info.is_dir():
+                members.append(info.filename)
+        
+        # Create set for sidecar lookup
+        members_set = set(members)
+        
+        # Second pass: create file details
         for info in zf.infolist():
             if info.is_dir():
                 continue
             
             member_path = info.filename
-            members.append(member_path)
             
             file_type = classify_file(member_path)
             ext = Path(member_path).suffix.lower()
@@ -337,6 +365,18 @@ def _scan_zip_archive(
             # Calculate hash if requested
             if compute_hashes and hash_zip_member:
                 file_detail.file_hash = hash_zip_member(zf, member_path)
+            
+            # Parse sidecar for media files
+            if parse_sidecars and file_type in ('photo', 'video') and find_sidecar_for_media and parse_sidecar_from_zip:
+                sidecar_path = find_sidecar_for_media(member_path, members_set)
+                if sidecar_path:
+                    file_detail.sidecar_path = sidecar_path
+                    sidecar_meta = parse_sidecar_from_zip(zf, sidecar_path)
+                    if sidecar_meta:
+                        if sidecar_meta.photo_taken_time:
+                            file_detail.photo_taken_time = sidecar_meta.photo_taken_time.isoformat()
+                        if sidecar_meta.creation_time:
+                            file_detail.creation_time = sidecar_meta.creation_time.isoformat()
             
             # Extract metadata from photos
             if has_pil() and file_type == 'photo':
@@ -361,6 +401,7 @@ def _scan_tar_archive(
     path: Path,
     metadata_stats: Dict[str, int],
     compute_hashes: bool = False,
+    parse_sidecars: bool = False,
 ) -> Tuple[List[FileDetails], List[str]]:
     """Scan a TAR archive and extract file details."""
     file_details_list: List[FileDetails] = []
@@ -371,14 +412,26 @@ def _scan_tar_archive(
     if compute_hashes:
         _, hash_tar_member, _ = _get_hash_functions()
     
+    # Get sidecar functions if needed
+    parse_sidecar_from_tar = None
+    find_sidecar_for_media = None
+    if parse_sidecars:
+        _, parse_sidecar_from_tar, _, find_sidecar_for_media = _get_sidecar_functions()
+    
     with tarfile.open(path, 'r:*') as tf:
+        # First pass: collect all member paths and create lookup dict
+        tar_members_dict = {}
         for tar_member in tf.getmembers():
-            if not tar_member.isfile():
-                continue
-            
-            member_path = tar_member.name.lstrip('./')
-            members.append(member_path)
-            
+            if tar_member.isfile():
+                member_path = tar_member.name.lstrip('./')
+                members.append(member_path)
+                tar_members_dict[member_path] = tar_member
+        
+        # Create set for sidecar lookup
+        members_set = set(members)
+        
+        # Second pass: create file details
+        for member_path, tar_member in tar_members_dict.items():
             file_type = classify_file(member_path)
             ext = Path(member_path).suffix.lower()
             
@@ -392,6 +445,19 @@ def _scan_tar_archive(
             # Calculate hash if requested
             if compute_hashes and hash_tar_member:
                 file_detail.file_hash = hash_tar_member(tf, member_path)
+            
+            # Parse sidecar for media files
+            if parse_sidecars and file_type in ('photo', 'video') and find_sidecar_for_media and parse_sidecar_from_tar:
+                sidecar_path = find_sidecar_for_media(member_path, members_set)
+                if sidecar_path and sidecar_path in tar_members_dict:
+                    file_detail.sidecar_path = sidecar_path
+                    sidecar_member = tar_members_dict[sidecar_path]
+                    sidecar_meta = parse_sidecar_from_tar(tf, sidecar_member)
+                    if sidecar_meta:
+                        if sidecar_meta.photo_taken_time:
+                            file_detail.photo_taken_time = sidecar_meta.photo_taken_time.isoformat()
+                        if sidecar_meta.creation_time:
+                            file_detail.creation_time = sidecar_meta.creation_time.isoformat()
             
             # Extract metadata from photos
             if has_pil() and file_type == 'photo':
@@ -410,12 +476,15 @@ def _scan_tar_archive(
             file_details_list.append(file_detail)
     
     return file_details_list, members
+    
+    return file_details_list, members
 
 
 def scan_directory(
     path: Path,
     save_discovery: bool = True,
     compute_hashes: bool = False,
+    parse_sidecars: bool = False,
 ) -> ArchiveSummary:
     """Scan an uncompressed directory and return a summary.
     
@@ -425,6 +494,7 @@ def scan_directory(
         path: Path to the directory
         save_discovery: If True, saves detailed tracking info to JSON
         compute_hashes: If True, calculate content hashes for duplicate detection
+        parse_sidecars: If True, parse JSON sidecars to extract authoritative timestamps
         
     Returns:
         ArchiveSummary with aggregate statistics
@@ -434,12 +504,29 @@ def scan_directory(
     if compute_hashes:
         _, _, hash_file_fn = _get_hash_functions()
     
+    # Get sidecar functions if needed
+    parse_sidecar_from_file = None
+    find_sidecar_for_media = None
+    if parse_sidecars:
+        _, _, parse_sidecar_from_file, find_sidecar_for_media = _get_sidecar_functions()
+    
     try:
         files: List[str] = []
         total_size = 0
         metadata_stats: Dict[str, int] = {'exif': 0, 'gps': 0, 'datetime': 0, 'checked': 0}
         file_details_list: List[FileDetails] = []
         
+        # First pass: collect all relative paths
+        for root, _dirs, filenames in os.walk(path):
+            for name in filenames:
+                file_path = Path(root) / name
+                rel_path = str(file_path.relative_to(path))
+                files.append(rel_path)
+        
+        # Create set for sidecar lookup
+        files_set = set(files)
+        
+        # Second pass: create file details
         for root, _dirs, filenames in os.walk(path):
             for name in filenames:
                 file_path = Path(root) / name
@@ -453,7 +540,6 @@ def scan_directory(
                 
                 # Make relative path for consistency
                 rel_path = str(file_path.relative_to(path))
-                files.append(rel_path)
                 
                 file_type = classify_file(rel_path)
                 ext = file_path.suffix.lower()
@@ -468,6 +554,19 @@ def scan_directory(
                 # Calculate hash if requested
                 if compute_hashes and hash_file_fn:
                     file_detail.file_hash = hash_file_fn(file_path)
+                
+                # Parse sidecar for media files
+                if parse_sidecars and file_type in ('photo', 'video') and find_sidecar_for_media and parse_sidecar_from_file:
+                    sidecar_rel_path = find_sidecar_for_media(rel_path, files_set)
+                    if sidecar_rel_path:
+                        file_detail.sidecar_path = sidecar_rel_path
+                        sidecar_full_path = path / sidecar_rel_path
+                        sidecar_meta = parse_sidecar_from_file(sidecar_full_path)
+                        if sidecar_meta:
+                            if sidecar_meta.photo_taken_time:
+                                file_detail.photo_taken_time = sidecar_meta.photo_taken_time.isoformat()
+                            if sidecar_meta.creation_time:
+                                file_detail.creation_time = sidecar_meta.creation_time.isoformat()
                 
                 # Extract metadata from photos
                 if has_pil() and file_type == 'photo':

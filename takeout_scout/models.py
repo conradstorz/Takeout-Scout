@@ -64,6 +64,9 @@ class FileDetails:
         extension: File extension including dot (e.g., '.jpg')
         metadata: Optional EXIF or other metadata dictionary
         file_hash: Optional content hash for duplicate detection
+        sidecar_path: Path to associated JSON sidecar (if found)
+        photo_taken_time: Authoritative capture time from sidecar (ISO format)
+        creation_time: Upload time from sidecar (ISO format)
     """
     path: str
     size: int
@@ -71,6 +74,9 @@ class FileDetails:
     extension: str
     metadata: Optional[Dict[str, Any]] = None
     file_hash: Optional[str] = None
+    sidecar_path: Optional[str] = None
+    photo_taken_time: Optional[str] = None  # ISO format string
+    creation_time: Optional[str] = None  # ISO format string
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -81,6 +87,9 @@ class FileDetails:
             'extension': self.extension,
             'metadata': self.metadata,
             'file_hash': self.file_hash,
+            'sidecar_path': self.sidecar_path,
+            'photo_taken_time': self.photo_taken_time,
+            'creation_time': self.creation_time,
         }
     
     @classmethod
@@ -93,6 +102,9 @@ class FileDetails:
             extension=data['extension'],
             metadata=data.get('metadata'),
             file_hash=data.get('file_hash'),
+            sidecar_path=data.get('sidecar_path'),
+            photo_taken_time=data.get('photo_taken_time'),
+            creation_time=data.get('creation_time'),
         )
 
 
