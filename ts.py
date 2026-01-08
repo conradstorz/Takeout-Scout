@@ -10,7 +10,7 @@ A desktop GUI utility that:
   • Logs all actions to ./logs/takeout_scout.log (rotated)
 
 Author: ChatGPT for Conrad
-License: MIT
+License: GNU GPL v3
 """
 from __future__ import annotations
 

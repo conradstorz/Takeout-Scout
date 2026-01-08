@@ -111,7 +111,7 @@ Takeout_Scout/
 ├── state/                     # Persistent state (auto-created)
 │   └── takeout_index.json
 ├── README.md                  # This file
-├── LICENSE                    # MIT License
+├── LICENSE                    # GNU GPL v3 License
 ├── pyproject.toml             # Project configuration
 └── .gitignore                 # Git ignore rules
 ```
@@ -138,7 +138,7 @@ All operations are logged to `logs/takeout_scout.log` with automatic rotation at
 
 ## License
 
-MIT License - See LICENSE file for details
+GNU General Public License v3 (GPLv3) - See LICENSE file for details
 
 ## Author
 
