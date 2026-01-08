@@ -289,6 +289,22 @@ def main():
     # Show duplicate analysis if hashes were computed
     if st.session_state.compute_hashes:
         show_duplicate_analysis()
+    
+    # Show timeline analysis
+    if st.session_state.results:
+        show_timeline_analysis()
+    
+    # Show orphan analysis if sidecars were parsed
+    if st.session_state.parse_sidecars and st.session_state.results:
+        show_orphan_analysis()
+    
+    # Show cross-archive analysis if multiple archives
+    if len(st.session_state.results) > 1 and st.session_state.compute_hashes:
+        show_cross_archive_analysis()
+    
+    # Show full inventory
+    if st.session_state.results:
+        show_full_inventory()
 
 
 def add_files_to_pending(paths: List[Path]):
@@ -747,6 +763,319 @@ def show_duplicate_analysis():
                 source_name = Path(source).name
                 st.markdown(f"- `{source_name}` → `{path}`")
             st.divider()
+    
+    # Export duplicate report
+    st.divider()
+    _export_duplicate_report(duplicates, stats)
+
+
+def _export_duplicate_report(duplicates: dict, stats: dict):
+    """Export duplicate analysis to CSV."""
+    export_rows = []
+    
+    for file_hash, locations in duplicates.items():
+        for i, (source, path) in enumerate(locations):
+            export_rows.append({
+                'hash': file_hash,
+                'source': source,
+                'file_path': path,
+                'is_first': i == 0,  # First occurrence (keep), rest are duplicates
+                'copy_number': i + 1,
+                'total_copies': len(locations),
+            })
+    
+    if not export_rows:
+        return
+    
+    df = pd.DataFrame(export_rows)
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        csv_full = df.to_csv(index=False)
+        st.download_button(
+            label="📥 Export Full Duplicate Report (CSV)",
+            data=csv_full,
+            file_name=f'duplicates_full_{timestamp}.csv',
+            mime='text/csv',
+        )
+    
+    with col2:
+        # Only duplicates (not first occurrence)
+        df_dupes = df[~df['is_first']]
+        if not df_dupes.empty:
+            csv_dupes = df_dupes.to_csv(index=False)
+            st.download_button(
+                label="🗑️ Export Duplicates Only (CSV)",
+                data=csv_dupes,
+                file_name=f'duplicates_only_{timestamp}.csv',
+                mime='text/csv',
+            )
+
+
+def show_timeline_analysis():
+    """Display timeline visualization of photos by date."""
+    from collections import Counter
+    
+    # Gather all dates
+    dates_by_month = Counter()
+    dates_by_year = Counter()
+    
+    for result in st.session_state.results:
+        try:
+            discovery = load_takeout_discovery(Path(result.path))
+            if not discovery:
+                continue
+            
+            for source_list in [discovery.archives, discovery.directories]:
+                for source in source_list:
+                    for fd in source.files:
+                        if fd.file_type in ('photo', 'video') and fd.photo_taken_time:
+                            try:
+                                dt = datetime.fromisoformat(fd.photo_taken_time)
+                                dates_by_year[dt.year] += 1
+                                dates_by_month[f"{dt.year}-{dt.month:02d}"] += 1
+                            except ValueError:
+                                pass
+        except Exception:
+            continue
+    
+    if not dates_by_year:
+        return
+    
+    st.header("📈 Timeline")
+    
+    # Year view
+    years = sorted(dates_by_year.keys())
+    year_counts = [dates_by_year[y] for y in years]
+    
+    year_df = pd.DataFrame({
+        'Year': years,
+        'Files': year_counts
+    })
+    
+    st.subheader("Photos by Year")
+    st.bar_chart(year_df.set_index('Year'))
+    
+    # Month view (last 5 years or all if less)
+    with st.expander("📅 Monthly Breakdown", expanded=False):
+        months = sorted(dates_by_month.keys())
+        if len(months) > 60:  # Limit to last 60 months
+            months = months[-60:]
+        month_counts = [dates_by_month[m] for m in months]
+        
+        month_df = pd.DataFrame({
+            'Month': months,
+            'Files': month_counts
+        })
+        st.bar_chart(month_df.set_index('Month'))
+
+
+def show_orphan_analysis():
+    """Detect orphaned sidecars and media without sidecars."""
+    orphan_sidecars = []  # JSON files without matching media
+    orphan_media = []  # Media files without matching JSON
+    paired_count = 0
+    
+    for result in st.session_state.results:
+        try:
+            discovery = load_takeout_discovery(Path(result.path))
+            if not discovery:
+                continue
+            
+            for source_list in [discovery.archives, discovery.directories]:
+                for source in source_list:
+                    # Build sets for lookup
+                    all_paths = {fd.path for fd in source.files}
+                    json_files = {fd.path for fd in source.files if fd.file_type == 'json'}
+                    media_files = {fd.path for fd in source.files if fd.file_type in ('photo', 'video')}
+                    
+                    # Check each media file for sidecar
+                    for fd in source.files:
+                        if fd.file_type in ('photo', 'video'):
+                            expected_sidecar = f"{fd.path}.json"
+                            if expected_sidecar in json_files or fd.sidecar_path:
+                                paired_count += 1
+                            else:
+                                orphan_media.append({
+                                    'source': str(source.path),
+                                    'path': fd.path,
+                                    'type': 'media_without_sidecar',
+                                })
+                    
+                    # Check each JSON for matching media
+                    for fd in source.files:
+                        if fd.file_type == 'json' and fd.path.endswith('.json'):
+                            # Expected media path: remove .json suffix
+                            if fd.path.endswith('.json'):
+                                expected_media = fd.path[:-5]  # Remove .json
+                                if expected_media not in media_files:
+                                    orphan_sidecars.append({
+                                        'source': str(source.path),
+                                        'path': fd.path,
+                                        'type': 'sidecar_without_media',
+                                    })
+        except Exception:
+            continue
+    
+    total_orphans = len(orphan_sidecars) + len(orphan_media)
+    
+    if total_orphans == 0 and paired_count == 0:
+        return
+    
+    st.header("🔗 Pairing Analysis")
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Properly Paired", f"{paired_count:,}")
+    col2.metric("Media Without Sidecar", f"{len(orphan_media):,}")
+    col3.metric("Orphan Sidecars", f"{len(orphan_sidecars):,}")
+    
+    if orphan_media:
+        with st.expander(f"⚠️ {len(orphan_media)} media files without sidecars", expanded=False):
+            for item in orphan_media[:100]:
+                st.text(f"{Path(item['source']).name}: {item['path']}")
+            if len(orphan_media) > 100:
+                st.info(f"... and {len(orphan_media) - 100} more")
+    
+    if orphan_sidecars:
+        with st.expander(f"⚠️ {len(orphan_sidecars)} sidecars without media", expanded=False):
+            for item in orphan_sidecars[:100]:
+                st.text(f"{Path(item['source']).name}: {item['path']}")
+            if len(orphan_sidecars) > 100:
+                st.info(f"... and {len(orphan_sidecars) - 100} more")
+
+
+def show_cross_archive_analysis():
+    """Analyze unique and shared files across archives."""
+    if not st.session_state.compute_hashes:
+        return
+    
+    hash_index = st.session_state.hash_index
+    if not hash_index._index:
+        return
+    
+    # Analyze file distribution across sources
+    files_by_source = {}  # source -> set of hashes
+    hash_to_sources = {}  # hash -> set of sources
+    
+    for file_hash, locations in hash_index._index.items():
+        sources = set()
+        for source, path in locations:
+            source_name = Path(source).name
+            sources.add(source_name)
+            
+            if source_name not in files_by_source:
+                files_by_source[source_name] = set()
+            files_by_source[source_name].add(file_hash)
+        
+        hash_to_sources[file_hash] = sources
+    
+    if len(files_by_source) < 2:
+        return  # Need at least 2 sources to compare
+    
+    st.header("📊 Cross-Archive Analysis")
+    
+    # Calculate unique vs shared for each source
+    analysis_rows = []
+    for source, hashes in files_by_source.items():
+        unique = sum(1 for h in hashes if len(hash_to_sources[h]) == 1)
+        shared = len(hashes) - unique
+        analysis_rows.append({
+            'Archive': source,
+            'Total Files': len(hashes),
+            'Unique Files': unique,
+            'Shared Files': shared,
+            'Unique %': f"{(unique/len(hashes)*100):.1f}%" if hashes else "0%",
+        })
+    
+    df = pd.DataFrame(analysis_rows)
+    st.dataframe(df, hide_index=True, use_container_width=True)
+    
+    # Show overlap matrix
+    if len(files_by_source) <= 10:  # Only show matrix for reasonable number of sources
+        with st.expander("🔀 Overlap Matrix", expanded=False):
+            sources = list(files_by_source.keys())
+            matrix_data = []
+            
+            for s1 in sources:
+                row = {'Archive': s1}
+                for s2 in sources:
+                    if s1 == s2:
+                        row[s2] = len(files_by_source[s1])
+                    else:
+                        overlap = len(files_by_source[s1] & files_by_source[s2])
+                        row[s2] = overlap
+                matrix_data.append(row)
+            
+            matrix_df = pd.DataFrame(matrix_data)
+            st.dataframe(matrix_df.set_index('Archive'), use_container_width=True)
+
+
+def show_full_inventory():
+    """Display and export full file inventory."""
+    inventory = []
+    
+    for result in st.session_state.results:
+        try:
+            discovery = load_takeout_discovery(Path(result.path))
+            if not discovery:
+                continue
+            
+            for source_list in [discovery.archives, discovery.directories]:
+                for source in source_list:
+                    for fd in source.files:
+                        inventory.append({
+                            'source': Path(source.path).name,
+                            'file_path': fd.path,
+                            'file_type': fd.file_type,
+                            'extension': fd.extension,
+                            'size_bytes': fd.size,
+                            'size_human': human_size(fd.size),
+                            'file_hash': fd.file_hash or '',
+                            'sidecar_path': fd.sidecar_path or '',
+                            'photo_taken_time': fd.photo_taken_time or '',
+                            'creation_time': fd.creation_time or '',
+                            'has_exif': fd.metadata.get('has_exif', False) if fd.metadata else False,
+                            'has_gps': fd.metadata.get('has_gps', False) if fd.metadata else False,
+                        })
+        except Exception:
+            continue
+    
+    if not inventory:
+        return
+    
+    st.header("📋 Full Inventory")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Files", f"{len(inventory):,}")
+    
+    photos = sum(1 for f in inventory if f['file_type'] == 'photo')
+    videos = sum(1 for f in inventory if f['file_type'] == 'video')
+    jsons = sum(1 for f in inventory if f['file_type'] == 'json')
+    
+    col2.metric("Photos", f"{photos:,}")
+    col3.metric("Videos", f"{videos:,}")
+    col4.metric("JSON Sidecars", f"{jsons:,}")
+    
+    # Export button
+    df = pd.DataFrame(inventory)
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    
+    csv = df.to_csv(index=False)
+    st.download_button(
+        label="📥 Export Full Inventory (CSV)",
+        data=csv,
+        file_name=f'file_inventory_{timestamp}.csv',
+        mime='text/csv',
+        type="primary",
+    )
+    
+    # Preview
+    with st.expander("👀 Preview Inventory", expanded=False):
+        st.dataframe(df.head(100), hide_index=True, use_container_width=True)
+        if len(df) > 100:
+            st.info(f"Showing first 100 of {len(df):,} files")
 
 
 def show_results():
