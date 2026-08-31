@@ -1,5 +1,12 @@
 # Takeout Scout
 
+> **Superseded by [Takeout_Inventory](../Takeout_Inventory).** Both tools scan
+> Takeout archives without extracting them to say what is inside. Inventory
+> scans more thoroughly, explains *why* each file is in the export, and
+> publishes a media↔sidecar pairing index. Scout's browser UI is replaced by a
+> static HTML report that needs no server and no dependencies. This repository
+> is no longer developed; nothing here has been deleted.
+
 A modern, web-based tool for scanning and analyzing Google Takeout archives without extraction.
 
 ## Features
