@@ -33,7 +33,7 @@ exif = ["pillow>=10.0.0"]
 full = ["loguru>=0.7.0", "pillow>=10.0.0"]
 
 [project.scripts]
-takeout-scout = "takeout_scout:main"
+takeout-scout = "run_app:main"
 
 [project.urls]
 Homepage = "https://github.com/conradstorz/Takeout-Scout"

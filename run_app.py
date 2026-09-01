@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Takeout Scout Launcher
-Starts the Streamlit web interface
+Takeout Scout launcher.
+
+Starts the Streamlit web interface (app.py). Named run_app.py, not
+takeout_scout.py, so it cannot shadow the takeout_scout/ package.
 """
 import sys
 import subprocess
@@ -10,7 +12,7 @@ from pathlib import Path
 
 def main():
     """Launch the Streamlit app."""
-    script_path = Path(__file__).parent / "ts.py"
+    script_path = Path(__file__).parent / "app.py"
     
     # Run streamlit with the app file
     cmd = [sys.executable, "-m", "streamlit", "run", str(script_path)] + sys.argv[1:]
