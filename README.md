@@ -22,9 +22,10 @@ A modern, web-based tool for scanning and analyzing Google Takeout archives with
 
 ## Requirements
 
-- Python 3.8+
-- Streamlit (included in dependencies)
+- Python 3.10+
+- Streamlit and pandas (required dependencies, installed automatically)
 - Optional: `loguru` for enhanced logging (falls back to standard logging)
+- Optional: `Pillow` for reading photo EXIF metadata
 
 ## Installation
 
@@ -38,11 +39,17 @@ cd Takeout-Scout
 
 2. Install with uv:
 ```bash
-# Install with enhanced logging
+# Base install (streamlit + pandas)
+uv pip install -e .
+
+# With enhanced logging
 uv pip install -e ".[logging]"
 
-# Or install minimal version (standard library only)
-uv pip install -e .
+# With EXIF metadata support
+uv pip install -e ".[exif]"
+
+# With everything
+uv pip install -e ".[full]"
 ```
 
 ### Using pip
@@ -55,11 +62,17 @@ cd Takeout-Scout
 
 2. Install dependencies:
 ```bash
+# Base install (streamlit + pandas)
+pip install -e .
+
 # With enhanced logging
 pip install -e ".[logging]"
 
-# Or minimal install
-pip install -e .
+# With EXIF metadata support
+pip install -e ".[exif]"
+
+# With everything
+pip install -e ".[full]"
 ```
 
 ## Usage
@@ -124,6 +137,7 @@ Takeout-Scout/
 │   └── takeout_scout.log
 ├── state/                     # Persistent state (auto-created)
 │   └── takeout_index.json
+├── discoveries_index.json    # Main index of all discoveries (auto-created)
 ├── takeouts_discovered/       # Per-source discovery records (auto-created)
 ├── README.md                  # This file
 ├── DISCOVERY_TRACKING.md      # How discovery records work
