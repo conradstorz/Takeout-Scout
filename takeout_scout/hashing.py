@@ -11,7 +11,7 @@ import io
 import tarfile
 import zipfile
 from pathlib import Path
-from typing import BinaryIO, Callable, Dict, List, Optional, Tuple
+from typing import BinaryIO, Callable, Dict, List, Optional, Set, Tuple
 
 from takeout_scout.logging import logger
 
@@ -164,6 +164,15 @@ class HashIndex:
     def get_hash(self, source_path: str, file_path: str) -> Optional[str]:
         """Get the hash for a specific file."""
         return self._by_path.get((source_path, file_path))
+
+    def entries(self) -> Dict[str, List[Tuple[str, str, int]]]:
+        """Every hash and the locations it was seen at.
+
+        A shallow copy, so a caller iterating it cannot be surprised by a
+        concurrent add, and nothing outside this class needs to know the
+        internal attribute name.
+        """
+        return dict(self._by_hash)
     
     def get_duplicates(self, file_hash: str) -> List[Tuple[str, str, int]]:
         """Get all files with the given hash."""
@@ -237,3 +246,35 @@ class HashIndex:
         for file_hash, files in other._by_hash.items():
             for source_path, file_path, size in files:
                 index.add(file_hash, source_path, file_path, size)
+
+
+def summarize_sources(
+    entries: Dict[str, List[Tuple[str, str, int]]],
+) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
+    """Group hashes by the source archive each was found in.
+
+    Returns (files_by_source, hash_to_sources):
+      - files_by_source maps a source *name* (the path's basename) to the set
+        of hashes found in it
+      - hash_to_sources maps a hash to the set of source names holding it
+
+    A hash in exactly one source is unique to that archive; in more than one,
+    it is shared. This consumes what HashIndex.add produces, so the tuple
+    layout is checked by tests rather than assumed at the call site.
+    """
+    files_by_source: Dict[str, Set[str]] = {}
+    hash_to_sources: Dict[str, Set[str]] = {}
+
+    for file_hash, locations in entries.items():
+        sources: Set[str] = set()
+        for source_path, file_path, size in locations:
+            source_name = Path(source_path).name
+            sources.add(source_name)
+
+            if source_name not in files_by_source:
+                files_by_source[source_name] = set()
+            files_by_source[source_name].add(file_hash)
+
+        hash_to_sources[file_hash] = sources
+
+    return files_by_source, hash_to_sources

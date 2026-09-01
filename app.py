@@ -37,6 +37,7 @@ from takeout_scout import (
     find_archives_and_dirs,
     human_size,
     HashIndex,
+    summarize_sources,
 )
 from takeout_scout.utils import partition_known_paths, remove_dirs
 from takeout_scout.constants import ensure_directories
@@ -1209,63 +1210,62 @@ def show_date_analysis():
             if not discovery:
                 continue
             
-            # Process archives and directories
-            for source_list in [discovery.archives, discovery.directories]:
-                for source in source_list:
-                    for fd in source.files:
-                        if fd.file_type in ('photo', 'video'):
-                            total_media += 1
-                            
-                            # Parse dates
-                            sidecar_dt = None
-                            exif_dt = None
-                            
-                            if fd.sidecar_path:
-                                with_sidecar += 1
-                            
-                            if fd.photo_taken_time:
-                                with_photo_taken_time += 1
-                                try:
-                                    sidecar_dt = datetime.fromisoformat(fd.photo_taken_time)
-                                    all_dates.append(sidecar_dt)
-                                except ValueError:
-                                    pass
-                            elif fd.creation_time:
-                                with_creation_time += 1
-                                try:
-                                    sidecar_dt = datetime.fromisoformat(fd.creation_time)
-                                except ValueError:
-                                    pass
-                            
-                            # Get EXIF date if available
-                            if fd.metadata and fd.metadata.get('datetime_original'):
-                                try:
-                                    exif_str = fd.metadata['datetime_original']
-                                    # EXIF format: "2019:07:15 14:00:05"
-                                    exif_dt = datetime.strptime(exif_str, "%Y:%m:%d %H:%M:%S")
-                                except (ValueError, TypeError):
-                                    pass
-                            
-                            # Create comparison
-                            diff_seconds = None
-                            if exif_dt and sidecar_dt:
-                                # Make both naive for comparison
-                                exif_naive = exif_dt.replace(tzinfo=None) if exif_dt.tzinfo else exif_dt
-                                sidecar_naive = sidecar_dt.replace(tzinfo=None) if sidecar_dt.tzinfo else sidecar_dt
-                                diff_seconds = (exif_naive - sidecar_naive).total_seconds()
-                            
-                            comparison = DateComparison(
-                                file_path=fd.path,
-                                exif_date=exif_dt,
-                                sidecar_date=sidecar_dt,
-                                difference_seconds=diff_seconds,
-                                source=str(source.path),
-                            )
-                            comparisons.append(comparison)
-                            
-                            if not sidecar_dt and not exif_dt:
-                                missing_dates.append(fd.path)
+            # Process the flat file list
+            for fd in discovery.file_details:
+                if fd.file_type in ('photo', 'video'):
+                    total_media += 1
+
+                    # Parse dates
+                    sidecar_dt = None
+                    exif_dt = None
+
+                    if fd.sidecar_path:
+                        with_sidecar += 1
+
+                    if fd.photo_taken_time:
+                        with_photo_taken_time += 1
+                        try:
+                            sidecar_dt = datetime.fromisoformat(fd.photo_taken_time)
+                            all_dates.append(sidecar_dt)
+                        except ValueError:
+                            pass
+                    elif fd.creation_time:
+                        with_creation_time += 1
+                        try:
+                            sidecar_dt = datetime.fromisoformat(fd.creation_time)
+                        except ValueError:
+                            pass
+
+                    # Get EXIF date if available
+                    if fd.metadata and fd.metadata.get('datetime_original'):
+                        try:
+                            exif_str = fd.metadata['datetime_original']
+                            # EXIF format: "2019:07:15 14:00:05"
+                            exif_dt = datetime.strptime(exif_str, "%Y:%m:%d %H:%M:%S")
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Create comparison
+                    diff_seconds = None
+                    if exif_dt and sidecar_dt:
+                        # Make both naive for comparison
+                        exif_naive = exif_dt.replace(tzinfo=None) if exif_dt.tzinfo else exif_dt
+                        sidecar_naive = sidecar_dt.replace(tzinfo=None) if sidecar_dt.tzinfo else sidecar_dt
+                        diff_seconds = (exif_naive - sidecar_naive).total_seconds()
+
+                    comparison = DateComparison(
+                        file_path=fd.path,
+                        exif_date=exif_dt,
+                        sidecar_date=sidecar_dt,
+                        difference_seconds=diff_seconds,
+                        source=str(discovery.source_path),
+                    )
+                    comparisons.append(comparison)
+
+                    if not sidecar_dt and not exif_dt:
+                        missing_dates.append(fd.path)
         except Exception:
+            logger.exception(f"Date analysis failed for {result.path}")
             continue
     
     if total_media == 0:
@@ -1487,17 +1487,16 @@ def show_timeline_analysis():
             if not discovery:
                 continue
             
-            for source_list in [discovery.archives, discovery.directories]:
-                for source in source_list:
-                    for fd in source.files:
-                        if fd.file_type in ('photo', 'video') and fd.photo_taken_time:
-                            try:
-                                dt = datetime.fromisoformat(fd.photo_taken_time)
-                                dates_by_year[dt.year] += 1
-                                dates_by_month[f"{dt.year}-{dt.month:02d}"] += 1
-                            except ValueError:
-                                pass
+            for fd in discovery.file_details:
+                if fd.file_type in ('photo', 'video') and fd.photo_taken_time:
+                    try:
+                        dt = datetime.fromisoformat(fd.photo_taken_time)
+                        dates_by_year[dt.year] += 1
+                        dates_by_month[f"{dt.year}-{dt.month:02d}"] += 1
+                    except ValueError:
+                        pass
         except Exception:
+            logger.exception(f"Timeline analysis failed for {result.path}")
             continue
     
     if not dates_by_year:
@@ -1543,39 +1542,37 @@ def show_orphan_analysis():
             if not discovery:
                 continue
             
-            for source_list in [discovery.archives, discovery.directories]:
-                for source in source_list:
-                    # Build sets for lookup
-                    all_paths = {fd.path for fd in source.files}
-                    json_files = {fd.path for fd in source.files if fd.file_type == 'json'}
-                    media_files = {fd.path for fd in source.files if fd.file_type in ('photo', 'video')}
-                    
-                    # Check each media file for sidecar
-                    for fd in source.files:
-                        if fd.file_type in ('photo', 'video'):
-                            expected_sidecar = f"{fd.path}.json"
-                            if expected_sidecar in json_files or fd.sidecar_path:
-                                paired_count += 1
-                            else:
-                                orphan_media.append({
-                                    'source': str(source.path),
-                                    'path': fd.path,
-                                    'type': 'media_without_sidecar',
-                                })
-                    
-                    # Check each JSON for matching media
-                    for fd in source.files:
-                        if fd.file_type == 'json' and fd.path.endswith('.json'):
-                            # Expected media path: remove .json suffix
-                            if fd.path.endswith('.json'):
-                                expected_media = fd.path[:-5]  # Remove .json
-                                if expected_media not in media_files:
-                                    orphan_sidecars.append({
-                                        'source': str(source.path),
-                                        'path': fd.path,
-                                        'type': 'sidecar_without_media',
-                                    })
+            # Build sets for lookup
+            json_files = {fd.path for fd in discovery.file_details if fd.file_type == 'json'}
+            media_files = {fd.path for fd in discovery.file_details if fd.file_type in ('photo', 'video')}
+
+            # Check each media file for sidecar
+            for fd in discovery.file_details:
+                if fd.file_type in ('photo', 'video'):
+                    expected_sidecar = f"{fd.path}.json"
+                    if expected_sidecar in json_files or fd.sidecar_path:
+                        paired_count += 1
+                    else:
+                        orphan_media.append({
+                            'source': str(discovery.source_path),
+                            'path': fd.path,
+                            'type': 'media_without_sidecar',
+                        })
+
+            # Check each JSON for matching media
+            for fd in discovery.file_details:
+                if fd.file_type == 'json' and fd.path.endswith('.json'):
+                    # Expected media path: remove .json suffix
+                    if fd.path.endswith('.json'):
+                        expected_media = fd.path[:-5]  # Remove .json
+                        if expected_media not in media_files:
+                            orphan_sidecars.append({
+                                'source': str(discovery.source_path),
+                                'path': fd.path,
+                                'type': 'sidecar_without_media',
+                            })
         except Exception:
+            logger.exception(f"Orphan analysis failed for {result.path}")
             continue
     
     total_orphans = len(orphan_sidecars) + len(orphan_media)
@@ -1611,25 +1608,12 @@ def show_cross_archive_analysis():
         return
     
     hash_index = st.session_state.hash_index
-    if not hash_index._index:
+    entries = hash_index.entries()
+    if not entries:
         return
-    
-    # Analyze file distribution across sources
-    files_by_source = {}  # source -> set of hashes
-    hash_to_sources = {}  # hash -> set of sources
-    
-    for file_hash, locations in hash_index._index.items():
-        sources = set()
-        for source, path in locations:
-            source_name = Path(source).name
-            sources.add(source_name)
-            
-            if source_name not in files_by_source:
-                files_by_source[source_name] = set()
-            files_by_source[source_name].add(file_hash)
-        
-        hash_to_sources[file_hash] = sources
-    
+
+    files_by_source, hash_to_sources = summarize_sources(entries)
+
     if len(files_by_source) < 2:
         return  # Need at least 2 sources to compare
     
@@ -1681,24 +1665,23 @@ def show_full_inventory():
             if not discovery:
                 continue
             
-            for source_list in [discovery.archives, discovery.directories]:
-                for source in source_list:
-                    for fd in source.files:
-                        inventory.append({
-                            'source': Path(source.path).name,
-                            'file_path': fd.path,
-                            'file_type': fd.file_type,
-                            'extension': fd.extension,
-                            'size_bytes': fd.size,
-                            'size_human': human_size(fd.size),
-                            'file_hash': fd.file_hash or '',
-                            'sidecar_path': fd.sidecar_path or '',
-                            'photo_taken_time': fd.photo_taken_time or '',
-                            'creation_time': fd.creation_time or '',
-                            'has_exif': fd.metadata.get('has_exif', False) if fd.metadata else False,
-                            'has_gps': fd.metadata.get('has_gps', False) if fd.metadata else False,
-                        })
+            for fd in discovery.file_details:
+                inventory.append({
+                    'source': Path(discovery.source_path).name,
+                    'file_path': fd.path,
+                    'file_type': fd.file_type,
+                    'extension': fd.extension,
+                    'size_bytes': fd.size,
+                    'size_human': human_size(fd.size),
+                    'file_hash': fd.file_hash or '',
+                    'sidecar_path': fd.sidecar_path or '',
+                    'photo_taken_time': fd.photo_taken_time or '',
+                    'creation_time': fd.creation_time or '',
+                    'has_exif': fd.metadata.get('has_exif', False) if fd.metadata else False,
+                    'has_gps': fd.metadata.get('has_gps', False) if fd.metadata else False,
+                })
         except Exception:
+            logger.exception(f"Inventory build failed for {result.path}")
             continue
     
     if not inventory:
