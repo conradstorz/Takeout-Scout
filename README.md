@@ -2,6 +2,12 @@
 
 A modern, web-based tool for scanning and analyzing Google Takeout archives without extraction.
 
+> **Where this fits.** [`Google_Takeout_Downloader`](https://github.com/conradstorz/Google_Takeout_Downloader)
+> fetches the archives. **Takeout Scout** explores them interactively in a
+> browser. [`Takeout_Inventory`](https://github.com/conradstorz/Takeout_Inventory)
+> produces a machine-readable pairing index and a static HTML report. Scout and
+> Inventory scan independently today — they share no code.
+
 ## Features
 
 - **🌐 Web Interface** - Clean, modern UI that runs in your browser
@@ -60,12 +66,12 @@ pip install -e .
 
 Run the web application:
 ```bash
-streamlit run ts.py
+streamlit run app.py
 ```
 
 Or use uv:
 ```bash
-uv run streamlit run ts.py
+uv run streamlit run app.py
 ```
 
 Or use the convenience launcher (after installation):
@@ -96,28 +102,35 @@ The app will automatically open in your default web browser at `http://localhost
 - **CSV Export** - Download results with timestamp
 - **Clear Results** - Start fresh with one click
 
-## Legacy Tkinter Version
-
-The original tkinter desktop version is still available as `ts.py`:
-```bash
-python ts.py
-# or
-uv run python ts.py
-```
-
 ## Project Structure
 
 ```
-Takeout_Scout/
-├── app.py                     # Streamlit web application (recommended)
-├── ts.py                      # Legacy tkinter desktop app
+Takeout-Scout/
+├── app.py                     # Streamlit web application
+├── run_app.py                 # Launcher: starts Streamlit on app.py
+├── takeout_scout/             # Scanning engine (importable package)
+│   ├── scanner.py             # Archive and directory scanning
+│   ├── sidecar.py             # Google Takeout JSON sidecar parsing
+│   ├── hashing.py             # File hashing utilities
+│   ├── metadata.py            # EXIF metadata extraction
+│   ├── discovery.py           # Discovery tracking system
+│   ├── models.py              # Data models
+│   ├── constants.py           # Constants and configuration
+│   ├── logging.py             # Logging configuration
+│   └── utils.py               # Utility functions
+├── tests/                     # pytest suite for takeout_scout/
+├── docs/superpowers/          # Design specs and implementation plans
 ├── logs/                      # Log files (auto-created)
 │   └── takeout_scout.log
 ├── state/                     # Persistent state (auto-created)
 │   └── takeout_index.json
+├── takeouts_discovered/       # Per-source discovery records (auto-created)
 ├── README.md                  # This file
+├── DISCOVERY_TRACKING.md      # How discovery records work
+├── METADATA_FEATURES.md       # EXIF extraction details
 ├── LICENSE                    # GNU GPL v3 License
 ├── pyproject.toml             # Project configuration
+├── requirements.txt           # Dependency list for pip users
 └── .gitignore                 # Git ignore rules
 ```
 
@@ -139,7 +152,7 @@ Planned features for future releases:
 
 ## Logging
 
-All operations are logged to `logs/takeout_scout.log` with automatic rotation at 5MB. Access logs via the "Open Logs..." button in the GUI.
+All operations are logged to `logs/takeout_scout.log` with automatic rotation at 5MB.
 
 ## License
 
