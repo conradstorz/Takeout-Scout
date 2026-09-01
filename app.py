@@ -15,11 +15,16 @@ License: GNU GPL v3
 """
 from __future__ import annotations
 
+import json
 import os
+import re
+import tarfile
+import zipfile
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
@@ -85,6 +90,92 @@ class FileInfo:
             'error_message': self.error_message,
             'file_type': self.file_type,
         }
+
+
+@dataclass
+class DeepScanResult:
+    """Results from deep analysis of a Takeout archive's folder structure."""
+    path: str
+
+    # Photo/JSON pairing analysis
+    paired_photos: int  # Photos with matching JSON
+    unpaired_photos: int  # Photos without JSON
+    orphaned_json: int  # JSON without matching photo
+
+    # Folder organization
+    organization_type: str  # 'by_year', 'by_album', 'by_date', 'flat', 'mixed'
+    folder_structure: Dict[str, int]  # Folder path -> file count
+    year_distribution: Dict[str, int]  # Year -> count
+
+    # Content details
+    albums: List[str]  # Album names found
+    date_range: Optional[Tuple[str, str]]  # Earliest, Latest dates
+
+    # Issues found
+    issues: List[str]  # List of problems discovered
+
+    def to_dict(self) -> dict:
+        return {
+            'Path': Path(self.path).name,
+            'Paired Photos': self.paired_photos,
+            'Unpaired Photos': self.unpaired_photos,
+            'Orphaned JSON': self.orphaned_json,
+            'Organization': self.organization_type,
+            'Folders': len(self.folder_structure),
+            'Years': ', '.join(sorted(self.year_distribution.keys())) if self.year_distribution else 'Unknown',
+            'Albums': len(self.albums),
+            'Date Range': f"{self.date_range[0]} to {self.date_range[1]}" if self.date_range else 'Unknown',
+            'Issues': len(self.issues),
+        }
+
+
+# --- State (persistent index) -----------------------------------------------
+STATE_DIR = Path('state')
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+RECENT_FOLDERS_PATH = STATE_DIR / 'recent_folders.json'
+MAX_RECENT_FOLDERS = 10
+
+
+# --- Recent folders helpers --------------------------------------------------
+def load_recent_folders() -> List[str]:
+    """Load list of recently accessed folders."""
+    if RECENT_FOLDERS_PATH.exists():
+        try:
+            with open(RECENT_FOLDERS_PATH, 'r', encoding='utf-8') as f:
+                folders = json.load(f)
+                # Filter to only existing folders
+                return [f for f in folders if Path(f).exists()]
+        except Exception:
+            logger.warning('Recent folders file unreadable; starting fresh.')
+    return []
+
+
+def save_recent_folders(folders: List[str]) -> None:
+    """Save list of recent folders."""
+    try:
+        with open(RECENT_FOLDERS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(folders, f, indent=2)
+    except Exception as e:
+        logger.exception(f'Failed to save recent folders: {e}')
+
+
+def add_recent_folder(folder_path: str) -> None:
+    """Add a folder to recent folders list."""
+    recent = st.session_state.recent_folders
+    folder_path = str(Path(folder_path).resolve())
+    
+    # Remove if already in list
+    if folder_path in recent:
+        recent.remove(folder_path)
+    
+    # Add to front
+    recent.insert(0, folder_path)
+    
+    # Keep only MAX_RECENT_FOLDERS
+    recent = recent[:MAX_RECENT_FOLDERS]
+    
+    st.session_state.recent_folders = recent
+    save_recent_folders(recent)
 
 
 # --- Quick validation functions ----------------------------------------------
@@ -208,46 +299,143 @@ def main():
     if 'scanned_paths' not in st.session_state:
         st.session_state.scanned_paths = set()
     if 'pending_files' not in st.session_state:
-        st.session_state.pending_files = []
+        st.session_state.pending_files = []  # List of FileInfo objects
     if 'compute_hashes' not in st.session_state:
         st.session_state.compute_hashes = False
     if 'hash_index' not in st.session_state:
         st.session_state.hash_index = HashIndex()
     if 'parse_sidecars' not in st.session_state:
         st.session_state.parse_sidecars = True  # Default on since it's so useful
-    
+    if 'recent_folders' not in st.session_state:
+        st.session_state.recent_folders = load_recent_folders()
+    if 'current_browse_path' not in st.session_state:
+        st.session_state.current_browse_path = Path.home()
+    if 'deep_scan_results' not in st.session_state:
+        st.session_state.deep_scan_results = {}  # path -> DeepScanResult
+
     # Sidebar for controls
     with st.sidebar:
         st.header("📂 Input")
+
+        # Create tabs for different selection methods
+        tab1, tab2, tab3 = st.tabs(["📁 Browse", "📋 Paste", "⬆️ Upload"])
         
-        # Folder input
-        folder_path = st.text_input(
-            "Enter folder path",
-            placeholder="/path/to/takeout/folder",
-            help="Path to a folder containing Takeout archives"
-        )
+        with tab1:
+            st.markdown("**Browse for folder:**")
+            
+            # Recent folders quick access
+            if st.session_state.recent_folders:
+                recent_folder = st.selectbox(
+                    "Recent folders:",
+                    options=['-- Select recent --'] + st.session_state.recent_folders,
+                    key='recent_select'
+                )
+                if recent_folder != '-- Select recent --':
+                    st.session_state.current_browse_path = Path(recent_folder)
+            
+            # Manual path entry with current path display
+            folder_path = st.text_input(
+                "Folder Path",
+                value=str(st.session_state.current_browse_path),
+                placeholder="Enter or edit folder path",
+                help="Type or paste a folder path"
+            )
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("📁 Load Folder", type="primary", width="stretch"):
+                    if folder_path:
+                        cleaned_path = clean_file_path(folder_path)
+                        path_obj = Path(cleaned_path)
+                        if path_obj.exists() and path_obj.is_dir():
+                            add_recent_folder(str(path_obj))
+                            load_folder(path_obj)
+                        else:
+                            st.error("Invalid folder path")
+            
+            with col2:
+                # Parent directory navigation
+                if st.button("⬆️ Up", width="stretch"):
+                    current = Path(folder_path) if folder_path else st.session_state.current_browse_path
+                    if current.parent != current:
+                        st.session_state.current_browse_path = current.parent
+                        st.rerun()
+            
+            # Browse current directory
+            if folder_path:
+                browse_path = Path(folder_path)
+                if browse_path.exists() and browse_path.is_dir():
+                    with st.expander("📂 Browse subfolders", expanded=False):
+                        try:
+                            subdirs = [d for d in browse_path.iterdir() if d.is_dir()]
+                            if subdirs:
+                                for subdir in sorted(subdirs)[:20]:  # Limit to 20
+                                    if st.button(f"📁 {subdir.name}", key=f"sub_{subdir}", width="stretch"):
+                                        st.session_state.current_browse_path = subdir
+                                        st.rerun()
+                                if len(subdirs) > 20:
+                                    st.caption(f"... and {len(subdirs) - 20} more")
+                            else:
+                                st.caption("No subfolders")
+                        except PermissionError:
+                            st.warning("⚠️ Permission denied")
         
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🔍 Scan Folder", disabled=not folder_path):
-                process_folder(Path(folder_path))
+        with tab2:
+            st.markdown("**Paste paths manually:**")
+            
+            paste_mode = st.radio(
+                "Type:",
+                ["Folder", "Files"],
+                horizontal=True,
+                label_visibility="collapsed"
+            )
+            
+            if paste_mode == "Folder":
+                folder_path_paste = st.text_input(
+                    "Folder Path",
+                    placeholder="Paste folder path from file explorer",
+                    help="Right-click folder → Copy as path",
+                    key="paste_folder"
+                )
+                if folder_path_paste and st.button("📁 Load Pasted Folder", type="primary", width="stretch"):
+                    cleaned_path = clean_file_path(folder_path_paste)
+                    path_obj = Path(cleaned_path)
+                    if path_obj.exists():
+                        add_recent_folder(str(path_obj))
+                    load_folder(path_obj)
+            else:
+                st.info("💡 One path per line")
+                file_paths_text = st.text_area(
+                    "File Paths",
+                    placeholder="C:\\path\\to\\file1.zip\nC:\\path\\to\\file2.zip",
+                    height=150,
+                    help="Shift+Right-click files → Copy as path",
+                    key="paste_files"
+                )
+                if file_paths_text and st.button("📄 Load Pasted Files", type="primary", width="stretch"):
+                    raw_paths = [line.strip() for line in file_paths_text.split('\n') if line.strip()]
+                    cleaned_paths = [clean_file_path(p) for p in raw_paths]
+                    load_files([Path(p) for p in cleaned_paths])
         
+        with tab3:
+            st.markdown("**Upload archives:**")
+            st.info("⚠️ Large files may take time to upload")
+            
+            uploaded_files = st.file_uploader(
+                "Choose ZIP/TGZ files",
+                type=['zip', 'tgz', 'tar.gz'],
+                accept_multiple_files=True,
+                help="Select one or more archive files to upload and scan",
+                label_visibility="collapsed"
+            )
+            
+            if uploaded_files:
+                st.write(f"Selected: {len(uploaded_files)} file(s)")
+                if st.button("⬆️ Process Uploads", type="primary", width="stretch"):
+                    process_uploaded_files(uploaded_files)
+
         st.divider()
-        
-        # File input
-        st.subheader("Or enter file paths")
-        file_paths_text = st.text_area(
-            "Enter file paths (one per line)",
-            placeholder="/path/to/archive1.zip\n/path/to/archive2.tgz",
-            help="Enter paths to individual archive files"
-        )
-        
-        if st.button("📄 Add Files", disabled=not file_paths_text):
-            paths = [Path(p.strip()) for p in file_paths_text.strip().split('\n') if p.strip()]
-            add_files_to_pending(paths)
-        
-        st.divider()
-        
+
         # Scan options
         st.header("⚙️ Options")
         st.session_state.parse_sidecars = st.checkbox(
@@ -260,136 +448,352 @@ def main():
             value=st.session_state.compute_hashes,
             help="Calculate MD5 hashes for duplicate detection (slower but enables duplicate analysis)"
         )
-        
+
         st.divider()
-        
-        # Export button
+
+        # Bulk actions
+        valid_count = sum(1 for f in st.session_state.pending_files if f.is_valid and f.status != FileStatus.SCANNED)
+        if valid_count > 0:
+            st.subheader("Bulk Actions")
+            if st.button(f"⚡ Scan All Pending ({valid_count})", type="primary", width="stretch"):
+                scan_all_pending()
+
         if st.session_state.results:
+            st.divider()
+            st.success(f"✅ {len(st.session_state.results)} items scanned")
             st.header("📊 Export")
             export_csv()
-        
-        # Clear button
-        st.divider()
-        if st.button("🗑️ Clear Results"):
-            st.session_state.results = []
-            st.session_state.scanned_paths = set()
-            st.session_state.pending_files = []
-            st.session_state.hash_index = HashIndex()
-            st.session_state.parse_sidecars = True
-            st.rerun()
-    
+
+            if st.button("🗑️ Clear Results", width="stretch"):
+                st.session_state.results = []
+                st.session_state.scanned_paths = set()
+                st.session_state.pending_files = []
+                st.session_state.hash_index = HashIndex()
+                st.session_state.parse_sidecars = True
+                st.session_state.deep_scan_results = {}
+                st.rerun()
+
     # Main content area
-    show_pending_files()
-    show_results()
-    
+    if st.session_state.pending_files:
+        st.subheader("📋 Files Ready to Scan")
+        display_file_cards()
+        st.divider()
+
+    if st.session_state.results:
+        st.subheader("✅ Scan Results")
+        display_results_table()
+    elif not st.session_state.pending_files:
+        show_welcome_screen()
+
     # Show date analysis if sidecars were parsed
     if st.session_state.parse_sidecars and st.session_state.results:
         show_date_analysis()
-    
+
     # Show duplicate analysis if hashes were computed
     if st.session_state.compute_hashes:
         show_duplicate_analysis()
-    
+
     # Show timeline analysis
     if st.session_state.results:
         show_timeline_analysis()
-    
+
     # Show orphan analysis if sidecars were parsed
     if st.session_state.parse_sidecars and st.session_state.results:
         show_orphan_analysis()
-    
+
     # Show cross-archive analysis if multiple archives
     if len(st.session_state.results) > 1 and st.session_state.compute_hashes:
         show_cross_archive_analysis()
-    
+
     # Show full inventory
     if st.session_state.results:
         show_full_inventory()
 
 
-def add_files_to_pending(paths: List[Path]):
-    """Add files to the pending list with validation."""
-    for path in paths:
-        # Skip if already in pending or scanned
-        if str(path) in st.session_state.scanned_paths:
-            continue
-        if any(f.path == path for f in st.session_state.pending_files):
-            continue
-        
-        file_info = validate_and_get_info(path)
+# --- UI Display Functions ----------------------------------------------------
+def display_file_cards():
+    """Display cards for each pending file, with scan/ignore actions."""
+    for idx, file_info in enumerate(st.session_state.pending_files):
+        with st.container():
+            col1, col2, col3 = st.columns([3, 2, 1])
+
+            with col1:
+                icon = get_file_icon(file_info)
+                st.markdown(f"### {icon} {file_info.name}")
+                st.caption(f"`{file_info.path.parent}`")
+
+            with col2:
+                status_color = get_status_color(file_info.status)
+                status_text = get_status_text(file_info)
+                st.markdown(f"**Status:** :{status_color}[{status_text}]")
+                st.markdown(f"**Size:** {human_size(file_info.size)}")
+                st.markdown(f"**Type:** {file_info.file_type or 'Unknown'}")
+
+            with col3:
+                if file_info.is_valid and file_info.status != FileStatus.SCANNED:
+                    btn_col1, btn_col2 = st.columns(2)
+                    with btn_col1:
+                        if st.button("🔍", key=f"scan_{idx}", type="primary", help="Scan this file", width="stretch"):
+                            scan_single_file(idx)
+                    with btn_col2:
+                        if st.button("🚫", key=f"ignore_{idx}", help="Ignore this file", width="stretch"):
+                            ignore_file(idx)
+                elif not file_info.is_valid:
+                    st.error("❌ Invalid")
+                else:
+                    st.success("✅ Done")
+
+            if file_info.error_message:
+                st.error(f"⚠️ {file_info.error_message}")
+
+            st.divider()
+
+
+def display_results_table():
+    """Display the scanned results in a table, with optional deep scan analysis."""
+    df = pd.DataFrame([r.to_dict() for r in st.session_state.results])
+
+    st.dataframe(
+        df,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Path": st.column_config.TextColumn("Path", width="large"),
+            "Service": st.column_config.TextColumn("Service", width="medium"),
+            "Size": st.column_config.TextColumn("Size", width="small"),
+        }
+    )
+
+    # Summary stats
+    col1, col2, col3, col4, col5 = st.columns(5)
+    total_files = sum(r.file_count for r in st.session_state.results)
+    total_photos = sum(r.photos for r in st.session_state.results)
+    total_videos = sum(r.videos for r in st.session_state.results)
+    total_json = sum(r.json_sidecars for r in st.session_state.results)
+    total_size = sum(r.compressed_size for r in st.session_state.results)
+
+    col1.metric("Total Files", f"{total_files:,}")
+    col2.metric("Photos", f"{total_photos:,}")
+    col3.metric("Videos", f"{total_videos:,}")
+    col4.metric("JSON", f"{total_json:,}")
+    col5.metric("Total Size", human_size(total_size))
+
+    # Deep scan section
+    st.divider()
+    st.subheader("🔬 Deep Scan Analysis")
+
+    for idx, result in enumerate(st.session_state.results):
+        result_path = result.path
+        has_deep_scan = result_path in st.session_state.deep_scan_results
+
+        with st.container():
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.markdown(f"**{Path(result_path).name}**")
+            with col2:
+                if not has_deep_scan:
+                    if st.button("🔬 Deep Scan", key=f"deep_{idx}", width="stretch"):
+                        perform_deep_scan(result_path, idx)
+                else:
+                    st.success("✅ Analyzed")
+
+            if has_deep_scan:
+                display_deep_scan_card(st.session_state.deep_scan_results[result_path])
+
+            st.divider()
+
+
+def show_welcome_screen():
+    """Show welcome screen when no files are loaded."""
+    st.info("👈 Select a folder or files from the sidebar to begin")
+
+    with st.expander("ℹ️ How to use"):
+        st.markdown("""
+        **Browse tab:**
+        1. Pick a recent folder or type/paste a path
+        2. Click 'Load Folder' to find archives and Takeout directories
+        3. Click individual scan buttons or 'Scan All Pending'
+
+        **Paste tab:**
+        1. Copy a folder path, or Shift+Right-Click files and choose 'Copy as path'
+        2. Paste into the box and load
+
+        **Upload tab:**
+        1. Choose ZIP/TGZ files to upload directly
+        2. Click 'Process Uploads'
+
+        **Features:**
+        - Instant file validation
+        - Non-destructive scanning (files are never modified)
+        - JSON sidecar parsing for authoritative photo dates
+        - Optional hash-based duplicate detection
+        - Detects Google Photos, Drive, Maps, and more
+        - Supports ZIP and TGZ archives, and uncompressed Takeout folders
+        - Deep scan for folder/album organization and pairing analysis
+        - Export results to CSV
+        """)
+
+
+def get_file_icon(file_info: FileInfo) -> str:
+    """Get an appropriate icon for the file type."""
+    if file_info.file_type == 'zip':
+        return '📦'
+    elif file_info.file_type == 'tgz':
+        return '📚'
+    elif file_info.file_type == 'directory':
+        return '📁'
+    else:
+        return '📄'
+
+
+def get_status_color(status: FileStatus) -> str:
+    """Get color for status badge."""
+    if status == FileStatus.VALID:
+        return 'green'
+    elif status == FileStatus.INVALID:
+        return 'red'
+    elif status == FileStatus.SCANNING:
+        return 'orange'
+    elif status == FileStatus.SCANNED:
+        return 'blue'
+    elif status == FileStatus.ERROR:
+        return 'red'
+    else:
+        return 'gray'
+
+
+def get_status_text(file_info: FileInfo) -> str:
+    """Get human-readable status text."""
+    if file_info.status == FileStatus.VALID:
+        return "Valid & Ready"
+    elif file_info.status == FileStatus.INVALID:
+        return "Invalid File"
+    elif file_info.status == FileStatus.SCANNING:
+        return "Scanning..."
+    elif file_info.status == FileStatus.SCANNED:
+        return "Scanned"
+    elif file_info.status == FileStatus.ERROR:
+        return "Error"
+    else:
+        return "Pending"
+
+
+# --- File Loading Functions --------------------------------------------------
+def clean_file_path(path_str: str) -> str:
+    """Clean up a file path string from various sources."""
+    # Remove quotes that Windows adds when you copy as path
+    path_str = path_str.strip()
+    if path_str.startswith('"') and path_str.endswith('"'):
+        path_str = path_str[1:-1]
+    # Also handle single quotes
+    if path_str.startswith("'") and path_str.endswith("'"):
+        path_str = path_str[1:-1]
+    return path_str.strip()
+
+
+def load_folder(folder_path: Path):
+    """Load and validate files from a folder."""
+    if not folder_path.exists():
+        st.error(f"❌ Folder not found: `{folder_path}`")
+        st.caption(f"Resolved path: `{folder_path.resolve()}`")
+        return
+
+    with st.spinner(f"Searching {folder_path.name}..."):
+        archives, directories = find_archives_and_dirs(folder_path)
+    all_items = list(archives) + list(directories)
+
+    if not all_items:
+        st.warning(f"⚠️ No archives or Takeout directories found in {folder_path}")
+        # Still validate the folder itself
+        file_info = validate_and_get_info(folder_path)
         st.session_state.pending_files.append(file_info)
-    
+        st.rerun()
+        return
+
+    progress_bar = st.progress(0, text=f"Validating 0/{len(all_items)} files...")
+    for i, item in enumerate(all_items, 1):
+        file_info = validate_and_get_info(item)
+        st.session_state.pending_files.append(file_info)
+        progress_bar.progress(i / len(all_items), text=f"Validating {i}/{len(all_items)} files...")
+
+    progress_bar.empty()
+    st.success(f"✅ Loaded {len(all_items)} files")
     st.rerun()
 
 
-def show_pending_files():
-    """Show the list of pending files with scan buttons."""
-    if not st.session_state.pending_files:
+def load_files(file_paths: List[Path]):
+    """Load and validate individual files."""
+    if not file_paths:
+        st.warning("⚠️ No file paths provided")
         return
-    
-    st.header("📋 Pending Files")
-    
-    # Scan All button
-    valid_count = sum(1 for f in st.session_state.pending_files if f.is_valid and f.status != FileStatus.SCANNED)
-    if valid_count > 0:
-        if st.button(f"⚡ Scan All ({valid_count} files)", type="primary"):
-            scan_all_pending()
-    
-    # Show each file
-    for index, file_info in enumerate(st.session_state.pending_files):
-        with st.container():
-            col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
-            
-            with col1:
-                if file_info.status == FileStatus.SCANNED:
-                    st.markdown(f"✅ **{file_info.name}**")
-                elif file_info.status == FileStatus.ERROR:
-                    st.markdown(f"❌ **{file_info.name}**")
-                elif not file_info.is_valid:
-                    st.markdown(f"⚠️ **{file_info.name}**")
-                else:
-                    st.markdown(f"📄 **{file_info.name}**")
-            
-            with col2:
-                st.text(human_size(file_info.size))
-            
-            with col3:
-                st.text(file_info.file_type or "—")
-            
-            with col4:
-                if file_info.is_valid and file_info.status != FileStatus.SCANNED:
-                    if st.button("Scan", key=f"scan_{index}"):
-                        scan_single_file(index, file_info)
-                elif file_info.error_message:
-                    st.text(file_info.error_message[:20])
+
+    valid_count = 0
+
+    with st.spinner(f"Validating {len(file_paths)} file(s)..."):
+        progress_bar = st.progress(0, text=f"Validating 0/{len(file_paths)} files...")
+
+        for i, file_path in enumerate(file_paths, 1):
+            file_info = validate_and_get_info(file_path)
+            st.session_state.pending_files.append(file_info)
+            if file_info.is_valid:
+                valid_count += 1
+            progress_bar.progress(i / len(file_paths), text=f"Validating {i}/{len(file_paths)} files...")
+
+        progress_bar.empty()
+
+        if valid_count == 0:
+            st.error("❌ No valid files found")
+            if st.session_state.pending_files:
+                first = st.session_state.pending_files[-len(file_paths)]
+                if first.error_message:
+                    st.caption(f"First error: {first.error_message}")
+                st.caption(f"Path tried: `{first.path}`")
+        elif valid_count < len(file_paths):
+            st.warning(f"⚠️ Loaded {valid_count}/{len(file_paths)} valid files")
+        else:
+            st.success(f"✅ All {valid_count} files are valid")
+
+        st.rerun()
 
 
-def scan_single_file(index: int, file_info: FileInfo):
-    """Scan a single file."""
+def ignore_file(index: int):
+    """Remove a file from the pending list without scanning it."""
+    file_info = st.session_state.pending_files[index]
+    logger.info(f"Ignoring file: {file_info.path}")
+    st.session_state.pending_files.pop(index)
+    st.success(f"🚫 Ignored {file_info.name}")
+    st.rerun()
+
+
+def scan_single_file(index: int):
+    """Scan a single file from the pending list."""
+    file_info = st.session_state.pending_files[index]
+    file_info.status = FileStatus.SCANNING
+    st.session_state.pending_files[index] = file_info
+
+    compute_hashes = st.session_state.compute_hashes
+    parse_sidecars = st.session_state.parse_sidecars
+
     try:
-        file_info.status = FileStatus.SCANNING
-        st.session_state.pending_files[index] = file_info
-        
-        compute_hashes = st.session_state.compute_hashes
-        parse_sidecars = st.session_state.parse_sidecars
-        
         with st.spinner(f"Scanning {file_info.name}..."):
             if file_info.file_type == 'directory':
                 summary = scan_directory(file_info.path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
             else:
                 summary = scan_archive(file_info.path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
-        
+
         st.session_state.results.append(summary)
         st.session_state.scanned_paths.add(str(file_info.path))
-        file_info.status = FileStatus.SCANNED
-        st.session_state.pending_files[index] = file_info
-        
+
         # Update hash index if hashes were computed
         if compute_hashes:
             _update_hash_index(file_info.path)
-        
+
+        # Remove from pending files after a successful scan
+        st.session_state.pending_files.pop(index)
+
+        st.success(f"✅ Scanned {file_info.name}")
         st.rerun()
-        
+
     except Exception as e:
         logger.exception(f"Failed to scan {file_info.path}: {e}")
         file_info.status = FileStatus.ERROR
@@ -401,34 +805,19 @@ def scan_single_file(index: int, file_info: FileInfo):
 def _update_hash_index(path: Path):
     """Update the hash index from scanned file data."""
     try:
-        discovery = load_takeout_discovery()
+        discovery = load_takeout_discovery(path)
         if discovery is None:
             return
-        
-        source_name = str(path)
-        
-        # Check both archives and directories for matching path
-        for archive in discovery.archives:
-            if str(archive.path) == source_name:
-                for file_detail in archive.files:
-                    if file_detail.file_hash:
-                        st.session_state.hash_index.add(
-                            file_detail.file_hash,
-                            str(archive.path),
-                            file_detail.path
-                        )
-                return
-        
-        for directory in discovery.directories:
-            if str(directory.path) == source_name:
-                for file_detail in directory.files:
-                    if file_detail.file_hash:
-                        st.session_state.hash_index.add(
-                            file_detail.file_hash,
-                            str(directory.path),
-                            file_detail.path
-                        )
-                return
+
+        for file_detail in discovery.file_details:
+            file_hash = file_detail.get('file_hash')
+            if file_hash:
+                st.session_state.hash_index.add(
+                    file_hash,
+                    discovery.source_path,
+                    file_detail.get('path'),
+                    file_detail.get('size', 0),
+                )
     except Exception as e:
         logger.warning(f"Failed to update hash index: {e}")
 
@@ -436,96 +825,339 @@ def _update_hash_index(path: Path):
 def scan_all_pending():
     """Scan all pending valid files."""
     valid_files = [
-        (i, f) for i, f in enumerate(st.session_state.pending_files)
+        f for f in st.session_state.pending_files
         if f.is_valid and f.status != FileStatus.SCANNED
     ]
-    
+
     if not valid_files:
         st.warning("No files to scan")
         return
-    
+
     compute_hashes = st.session_state.compute_hashes
     parse_sidecars = st.session_state.parse_sidecars
     progress_bar = st.progress(0, text=f"Scanning 0/{len(valid_files)} files...")
-    
-    for count, (index, file_info) in enumerate(valid_files, 1):
+
+    scanned_count = 0
+    error_count = 0
+
+    for count, file_info in enumerate(valid_files, 1):
         try:
             if file_info.file_type == 'directory':
                 summary = scan_directory(file_info.path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
             else:
                 summary = scan_archive(file_info.path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
-            
+
             st.session_state.results.append(summary)
             st.session_state.scanned_paths.add(str(file_info.path))
-            file_info.status = FileStatus.SCANNED
-            st.session_state.pending_files[index] = file_info
-            
-            # Update hash index if hashes were computed
+
             if compute_hashes:
                 _update_hash_index(file_info.path)
-            
+
+            # Remove from pending files after a successful scan
+            st.session_state.pending_files.remove(file_info)
+            scanned_count += 1
+
         except Exception as e:
             logger.exception(f"Failed to scan {file_info.path}: {e}")
             file_info.status = FileStatus.ERROR
             file_info.error_message = str(e)
-            st.session_state.pending_files[index] = file_info
-        
-        progress_bar.progress(count / len(valid_files), text=f"Scanning {count}/{len(valid_files)} files...")
-    
+            # Keep error files in the list but update their status
+            for i, f in enumerate(st.session_state.pending_files):
+                if f.path == file_info.path:
+                    st.session_state.pending_files[i] = file_info
+                    break
+            error_count += 1
+
+        progress_bar.progress(count / len(valid_files), text=f"Completed {count}/{len(valid_files)} files")
+
     progress_bar.empty()
-    st.success(f"✅ Scanned {len(valid_files)} files")
+
+    if error_count > 0:
+        st.warning(f"✅ Scanned {scanned_count} files, ⚠️ {error_count} errors")
+    else:
+        st.success(f"✅ Scanned {scanned_count} files")
     st.rerun()
 
 
-def process_folder(folder_path: Path):
-    """Process a folder by finding and scanning all archives/directories."""
-    if not folder_path.exists():
-        st.error(f"❌ Folder not found: {folder_path}")
-        return
-    
-    compute_hashes = st.session_state.compute_hashes
-    parse_sidecars = st.session_state.parse_sidecars
-    
-    with st.spinner(f"Scanning {folder_path.name}..."):
-        archives, directories = find_archives_and_dirs(folder_path)
-        total = len(archives) + len(directories)
-        
-        if total == 0:
-            st.warning(f"⚠️ No Takeout archives or directories found in {folder_path}")
-            summary = scan_directory(folder_path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
-            if summary.file_count > 0:
-                st.session_state.results.append(summary)
-                st.session_state.scanned_paths.add(str(folder_path))
-                if compute_hashes:
-                    _update_hash_index(folder_path)
-            return
-        
-        progress_bar = st.progress(0, text=f"Scanning 0/{total} items...")
-        
-        count = 0
-        for directory in directories:
-            if str(directory) not in st.session_state.scanned_paths:
-                summary = scan_directory(directory, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
-                st.session_state.results.append(summary)
-                st.session_state.scanned_paths.add(str(directory))
-                if compute_hashes:
-                    _update_hash_index(directory)
-            count += 1
-            progress_bar.progress(count / total, text=f"Scanning {count}/{total} items...")
-        
-        for archive in archives:
-            if str(archive) not in st.session_state.scanned_paths:
-                summary = scan_archive(archive, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
-                st.session_state.results.append(summary)
-                st.session_state.scanned_paths.add(str(archive))
-                if compute_hashes:
-                    _update_hash_index(archive)
-            count += 1
-            progress_bar.progress(count / total, text=f"Scanning {count}/{total} items...")
-        
+# --- Deep Scan Functions -----------------------------------------------------
+def deep_scan_archive(path: Path, progress_callback=None) -> DeepScanResult:
+    """Perform deep analysis of an archive's structure and contents."""
+    from takeout_scout.scanner import iter_zip_members, iter_tar_members
+
+    if progress_callback:
+        progress_callback("Starting deep scan...", 0.1)
+
+    members: List[str] = []
+    try:
+        if path.suffix.lower() == '.zip':
+            with zipfile.ZipFile(path) as zf:
+                members = list(iter_zip_members(zf))
+        elif path.suffix.lower() in {'.tgz', '.gz'} or path.name.lower().endswith('.tar.gz'):
+            with tarfile.open(path, 'r:*') as tf:
+                members = list(iter_tar_members(tf))
+    except Exception as e:
+        logger.exception(f"Failed to read archive for deep scan: {e}")
+        return DeepScanResult(
+            path=str(path),
+            paired_photos=0, unpaired_photos=0, orphaned_json=0,
+            organization_type='error',
+            folder_structure={}, year_distribution={},
+            albums=[], date_range=None,
+            issues=[f"Failed to read archive: {e}"]
+        )
+
+    if progress_callback:
+        progress_callback(f"Analyzing {len(members)} files...", 0.3)
+
+    return analyze_file_structure(members, str(path), progress_callback)
+
+
+def deep_scan_directory(path: Path, progress_callback=None) -> DeepScanResult:
+    """Perform deep analysis of a directory's structure and contents."""
+    if progress_callback:
+        progress_callback("Collecting files...", 0.1)
+
+    members: List[str] = []
+    for root, _dirs, filenames in os.walk(path):
+        for name in filenames:
+            file_path = Path(root) / name
+            rel_path = str(file_path.relative_to(path))
+            members.append(rel_path)
+
+    if progress_callback:
+        progress_callback(f"Analyzing {len(members)} files...", 0.3)
+
+    return analyze_file_structure(members, str(path), progress_callback)
+
+
+def analyze_file_structure(members: List[str], base_path: str, progress_callback=None) -> DeepScanResult:
+    """Analyze the structure and organization of files."""
+    from collections import defaultdict
+    from takeout_scout.constants import MEDIA_PHOTO_EXT
+
+    photos: Dict[str, str] = {}
+    jsons: Dict[str, str] = {}
+
+    folder_structure: Dict[str, int] = defaultdict(int)
+    year_distribution: Dict[str, int] = defaultdict(int)
+    albums = set()
+    dates = []
+    issues = []
+
+    date_pattern = re.compile(r'(\d{4})[_-]?(\d{2})[_-]?(\d{2})')
+    year_pattern = re.compile(r'/(\d{4})/')
+
+    for idx, member in enumerate(members):
+        if progress_callback and idx % 500 == 0:
+            progress_callback(f"Analyzing file {idx}/{len(members)}...", 0.3 + (idx / len(members)) * 0.5)
+
+        member_lower = member.lower()
+        folder = str(Path(member).parent)
+        folder_structure[folder] += 1
+
+        folder_parts = folder.split('/')
+        for part in folder_parts:
+            if part and not part.isdigit() and part.lower() not in {'google photos', 'takeout', 'photos', 'archive'}:
+                if not re.match(r'^\d{4}$', part):
+                    albums.add(part)
+
+        year_match = year_pattern.search(member)
+        if year_match:
+            year_distribution[year_match.group(1)] += 1
+
+        date_match = date_pattern.search(member)
+        if date_match:
+            try:
+                date_str = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+                dates.append(date_str)
+            except Exception:
+                pass
+
+        if any(member_lower.endswith(ext) for ext in MEDIA_PHOTO_EXT):
+            base = Path(member).stem
+            photos[f"{folder}/{base}"] = member
+        elif member_lower.endswith('.json'):
+            base = Path(member).stem
+            if '.' in base:
+                base = base.rsplit('.', 1)[0]
+            jsons[f"{folder}/{base}"] = member
+
+    if progress_callback:
+        progress_callback("Analyzing pairing and organization...", 0.9)
+
+    photo_bases = set(photos.keys())
+    json_bases = set(jsons.keys())
+
+    paired = photo_bases & json_bases
+    unpaired_photos = photo_bases - json_bases
+    orphaned_json = json_bases - photo_bases
+
+    org_type = detect_organization_type(folder_structure, year_distribution, albums)
+
+    date_range = None
+    if dates:
+        sorted_dates = sorted(dates)
+        date_range = (sorted_dates[0], sorted_dates[-1])
+
+    if len(unpaired_photos) > len(paired) * 0.5:
+        issues.append(f"Many photos missing JSON metadata ({len(unpaired_photos)} unpaired)")
+
+    if len(orphaned_json) > 100:
+        issues.append(f"{len(orphaned_json)} JSON files without matching photos")
+
+    if len(folder_structure) > 1000:
+        issues.append(f"Highly fragmented: {len(folder_structure)} folders")
+
+    if not year_distribution:
+        issues.append("No year information found in folder structure")
+
+    return DeepScanResult(
+        path=base_path,
+        paired_photos=len(paired),
+        unpaired_photos=len(unpaired_photos),
+        orphaned_json=len(orphaned_json),
+        organization_type=org_type,
+        folder_structure=dict(folder_structure),
+        year_distribution=dict(year_distribution),
+        albums=sorted(list(albums))[:50],
+        date_range=date_range,
+        issues=issues
+    )
+
+
+def detect_organization_type(folder_structure: Dict[str, int], year_dist: Dict[str, int], albums: set) -> str:
+    """Detect how the content is organized."""
+    if not folder_structure or len(folder_structure) == 1:
+        return 'flat'
+
+    year_folders = sum(1 for folder in folder_structure.keys() if any(year in folder for year in year_dist.keys()))
+    if year_folders > len(folder_structure) * 0.5:
+        return 'by_year'
+
+    if len(albums) > 5 and len(folder_structure) > 3:
+        return 'by_album'
+
+    date_folders = sum(1 for folder in folder_structure.keys() if re.search(r'\d{4}-\d{2}-\d{2}', folder))
+    if date_folders > len(folder_structure) * 0.3:
+        return 'by_date'
+
+    return 'mixed'
+
+
+def perform_deep_scan(file_path: str, index: int):
+    """Perform deep scan on a previously scanned file."""
+    path = Path(file_path)
+
+    progress_bar = st.progress(0, text=f"Deep scanning {path.name}...")
+    status_text = st.empty()
+
+    def update_progress(message: str, progress: float):
+        progress_bar.progress(progress, text=message)
+        status_text.text(message)
+
+    try:
+        if path.is_file():
+            result = deep_scan_archive(path, progress_callback=update_progress)
+        else:
+            result = deep_scan_directory(path, progress_callback=update_progress)
+
+        st.session_state.deep_scan_results[file_path] = result
+
         progress_bar.empty()
-        st.success(f"✅ Scanned {total} items from {folder_path.name}")
+        status_text.empty()
+        st.success(f"🔬 Deep scan complete for {path.name}")
         st.rerun()
+
+    except Exception as e:
+        logger.exception(f"Failed to deep scan {file_path}: {e}")
+        progress_bar.empty()
+        status_text.empty()
+        st.error(f"❌ Deep scan failed: {e}")
+
+
+def build_folder_tree(folder_paths: List[str]) -> dict:
+    """Build a hierarchical tree structure from folder paths."""
+    tree: dict = {}
+
+    for path in sorted(folder_paths):
+        parts = path.split('/') if '/' in path else path.split('\\')
+        current = tree
+
+        for part in parts:
+            if part:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+
+    return tree
+
+
+def display_folder_tree(tree: dict, indent: int = 0):
+    """Display folder tree in a hierarchical format."""
+    for name, subtree in sorted(tree.items()):
+        prefix = "  " * indent + ("└─ " if indent > 0 else "📁 ")
+        st.markdown(f"`{prefix}{name}`")
+        if subtree:
+            display_folder_tree(subtree, indent + 1)
+
+
+def display_deep_scan_card(result: DeepScanResult):
+    """Display detailed deep scan results in an expandable card."""
+    with st.expander("📊 View Deep Scan Details", expanded=True):
+        st.markdown("#### 📷 Photo & Metadata Pairing")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("✅ Paired Photos", f"{result.paired_photos:,}",
+                   help="Photos with matching JSON metadata files")
+        col2.metric("📸 Unpaired Photos", f"{result.unpaired_photos:,}",
+                   help="Photos without JSON metadata")
+        col3.metric("🗒️ Orphaned JSON", f"{result.orphaned_json:,}",
+                   help="JSON files without matching photos")
+
+        st.markdown("#### 📁 Folder Organization")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**Type:** `{result.organization_type}`")
+            st.markdown(f"**Total Folders:** {len(result.folder_structure):,}")
+        with col2:
+            if result.date_range:
+                st.markdown("**Date Range:**")
+                st.caption(f"{result.date_range[0]} → {result.date_range[1]}")
+
+        if result.year_distribution:
+            st.markdown("#### 📅 Content by Year")
+            year_data = pd.DataFrame([
+                {"Year": year, "Files": count}
+                for year, count in sorted(result.year_distribution.items())
+            ])
+            st.bar_chart(year_data.set_index("Year"))
+
+        if result.albums:
+            st.markdown(f"#### 📚 Albums ({len(result.albums)})")
+            if len(result.albums) <= 10:
+                for album in result.albums:
+                    st.markdown(f"- {album}")
+            else:
+                with st.expander(f"Show all {len(result.albums)} albums"):
+                    for album in result.albums:
+                        st.markdown(f"- {album}")
+
+        if result.folder_structure:
+            st.markdown("#### 📂 Folder Structure")
+
+            top_folders = sorted(result.folder_structure.items(), key=lambda x: x[1], reverse=True)[:10]
+            folder_df = pd.DataFrame(top_folders, columns=["Folder", "Files"])
+            st.dataframe(folder_df, hide_index=True, width="stretch")
+
+            if len(result.folder_structure) > 10:
+                with st.expander(f"📂 Show all {len(result.folder_structure)} folders"):
+                    folder_tree = build_folder_tree(list(result.folder_structure.keys()))
+                    display_folder_tree(folder_tree)
+
+        if result.issues:
+            st.markdown("#### ⚠️ Issues Detected")
+            for issue in result.issues:
+                st.warning(issue)
+
 
 
 def show_date_analysis():
@@ -1078,42 +1710,40 @@ def show_full_inventory():
             st.info(f"Showing first 100 of {len(df):,} files")
 
 
-def show_results():
-    """Display scan results in a table."""
-    if not st.session_state.results:
-        st.info("👆 Select a folder or files to scan")
+def process_uploaded_files(uploaded_files):
+    """Process files uploaded through Streamlit's file uploader."""
+    import tempfile
+    import shutil
+    
+    if not uploaded_files:
         return
     
-    st.header("📊 Results")
+    # Create temp directory for uploads
+    temp_dir = Path(tempfile.mkdtemp(prefix='takeout_scout_'))
     
-    # Summary stats
-    total_files = sum(r.file_count for r in st.session_state.results)
-    total_photos = sum(r.photos for r in st.session_state.results)
-    total_videos = sum(r.videos for r in st.session_state.results)
-    total_size = sum(r.compressed_size for r in st.session_state.results)
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Archives", len(st.session_state.results))
-    col2.metric("Total Files", f"{total_files:,}")
-    col3.metric("Photos/Videos", f"{total_photos:,} / {total_videos:,}")
-    col4.metric("Total Size", human_size(total_size))
-    
-    st.divider()
-    
-    # Results table
-    df = pd.DataFrame([r.to_dict() for r in st.session_state.results])
-    
-    # ArchiveSummary.to_dict() already uses display-friendly keys
-    # Just need to format the Path column to show filename only
-    if 'Path' in df.columns:
-        df['Path'] = df['Path'].apply(lambda x: Path(x).name)
-    
-    # Display table
-    st.dataframe(
-        df,
-        width="stretch",
-        hide_index=True,
-    )
+    try:
+        with st.spinner(f"Processing {len(uploaded_files)} uploaded file(s)..."):
+            file_paths = []
+            
+            for uploaded_file in uploaded_files:
+                # Save uploaded file to temp location
+                temp_path = temp_dir / uploaded_file.name
+                with open(temp_path, 'wb') as f:
+                    f.write(uploaded_file.getbuffer())
+                file_paths.append(temp_path)
+                logger.info(f"Saved upload: {uploaded_file.name} ({human_size(uploaded_file.size)})")
+            
+            # Now scan them
+            load_files(file_paths)
+            st.success(f"✅ Uploaded and loaded {len(file_paths)} file(s)")
+            
+    except Exception as e:
+        logger.exception(f"Error processing uploads: {e}")
+        st.error(f"❌ Error processing uploads: {e}")
+    finally:
+        # Cleanup temp directory after a delay (files might still be in use)
+        # Note: In production, you might want a better cleanup strategy
+        pass
 
 
 def export_csv():
@@ -1137,4 +1767,20 @@ def export_csv():
 
 
 if __name__ == '__main__':
+    # If launched directly with `python app.py` (not via `streamlit run`),
+    # re-invoke ourselves under Streamlit so the app is self-launching.
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is None:
+            import subprocess
+            import sys as _sys
+
+            script_path = Path(__file__).resolve()
+            cmd = [_sys.executable, "-m", "streamlit", "run", str(script_path)] + _sys.argv[1:]
+            subprocess.run(cmd)
+            _sys.exit(0)
+    except ImportError:
+        pass
+
+    # Running via streamlit, proceed normally
     main()
