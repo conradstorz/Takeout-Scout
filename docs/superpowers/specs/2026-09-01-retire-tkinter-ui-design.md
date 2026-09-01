@@ -156,8 +156,10 @@ This is the repository's only test that covers documentation.
    the new documentation test. An unchanged count for the pre-existing tests is
    the evidence that deleting `ts.py` was inert.
 2. `app.py` parses and `run_app.main` imports, so the console script resolves.
-3. `git grep -n "ts\.py" -- ":!docs/"` returns nothing. `docs/` is excluded
-   because this spec and its plan quote the removed file deliberately.
+3. `git grep -n "\bts\.py" -- ":!docs/"` returns nothing. The word boundary is
+   required — without it the pattern matches inside `constants.py`, a module
+   the README's own structure diagram lists. `docs/` is excluded because this
+   spec and its plan quote the removed file deliberately.
 
 ## Deferred
 

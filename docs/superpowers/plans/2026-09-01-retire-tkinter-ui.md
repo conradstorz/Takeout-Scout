@@ -594,14 +594,21 @@ New columns in the table view:
 
 - [ ] **Step 5: Verify no reference survives**
 
-Run: `git grep -n "ts\.py" -- ":!docs/"`
+Run: `git grep -n "\bts\.py" -- ":!docs/"`
 
 Expected: no output. `git grep` exits 1 when it finds nothing — that exit code
 is the pass condition here, not a failure.
 
-Run: `git grep -n -i "tkinter" -- ":!docs/"`
+**The `\b` is required.** Without it the pattern matches inside
+`constants.py` — `consta` + `nts.py` — and the README's own Project Structure
+block lists that module, so an unanchored search reports a hit that has
+nothing to do with the deleted file.
 
-Expected: no output.
+Run: `git grep -n -i "tkinter" -- ":!docs/" ":!tests/test_docs.py"`
+
+Expected: no output. `tests/test_docs.py` is excluded because the guard's
+docstring names Tkinter to explain what the guard exists to catch — describing
+the removed file is the opposite of depending on it.
 
 `docs/` is excluded because the spec and this plan quote the removed file on
 purpose, as the record of what was changed.
@@ -624,7 +631,7 @@ Run: `git commit -m "docs: drop the last references to the removed Tkinter UI"`
 ## Definition of done
 
 1. `uv run pytest -q` passes, with the original **170 unchanged** plus the new guard's tests (3 fixed, plus one parametrized case per reader-facing Markdown file on disk — 4 at time of writing, so 177 total). The 170 is the binding number; the total moves with the Markdown file list.
-2. `git grep -n "ts\.py" -- ":!docs/"` returns nothing.
+2. `git grep -n "\bts\.py" -- ":!docs/"` returns nothing. The word boundary matters: without it the pattern matches inside `constants.py`.
 3. `ts.py` does not exist.
 4. `README.md` names `app.py` in both Usage commands, carries the "Where this fits" paragraph, and its Project Structure block lists `takeout_scout/`, `tests/` and `run_app.py`.
 
