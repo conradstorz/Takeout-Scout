@@ -38,6 +38,7 @@ from takeout_scout import (
     human_size,
     HashIndex,
 )
+from takeout_scout.utils import partition_known_paths, remove_dirs
 from takeout_scout.constants import ensure_directories
 from takeout_scout.logging import logger
 from takeout_scout.discovery import load_takeout_discovery
@@ -312,6 +313,8 @@ def main():
         st.session_state.current_browse_path = Path.home()
     if 'deep_scan_results' not in st.session_state:
         st.session_state.deep_scan_results = {}  # path -> DeepScanResult
+    if 'upload_dirs' not in st.session_state:
+        st.session_state.upload_dirs = []  # Temp dirs from previous uploads, pending cleanup
 
     # Sidebar for controls
     with st.sidebar:
@@ -471,6 +474,8 @@ def main():
                 st.session_state.hash_index = HashIndex()
                 st.session_state.parse_sidecars = True
                 st.session_state.deep_scan_results = {}
+                remove_dirs(st.session_state.upload_dirs)
+                st.session_state.upload_dirs = []
                 st.rerun()
 
     # Main content area
@@ -710,14 +715,24 @@ def load_folder(folder_path: Path):
         st.rerun()
         return
 
-    progress_bar = st.progress(0, text=f"Validating 0/{len(all_items)} files...")
-    for i, item in enumerate(all_items, 1):
+    known = set(st.session_state.scanned_paths)
+    known.update(str(f.path) for f in st.session_state.pending_files)
+    new_items, already = partition_known_paths(all_items, known)
+
+    if already:
+        st.info(f"ℹ️ Skipped {len(already)} item(s) already queued or already scanned")
+
+    if not new_items:
+        return
+
+    progress_bar = st.progress(0, text=f"Validating 0/{len(new_items)} files...")
+    for i, item in enumerate(new_items, 1):
         file_info = validate_and_get_info(item)
         st.session_state.pending_files.append(file_info)
-        progress_bar.progress(i / len(all_items), text=f"Validating {i}/{len(all_items)} files...")
+        progress_bar.progress(i / len(new_items), text=f"Validating {i}/{len(new_items)} files...")
 
     progress_bar.empty()
-    st.success(f"✅ Loaded {len(all_items)} files")
+    st.success(f"✅ Loaded {len(new_items)} files")
     st.rerun()
 
 
@@ -727,29 +742,41 @@ def load_files(file_paths: List[Path]):
         st.warning("⚠️ No file paths provided")
         return
 
+    known = set(st.session_state.scanned_paths)
+    known.update(str(f.path) for f in st.session_state.pending_files)
+    new_items, already = partition_known_paths(file_paths, known)
+
+    if already:
+        st.info(f"ℹ️ Skipped {len(already)} file(s) already queued or already scanned")
+
+    if not new_items:
+        return
+
     valid_count = 0
+    first_appended = None
 
-    with st.spinner(f"Validating {len(file_paths)} file(s)..."):
-        progress_bar = st.progress(0, text=f"Validating 0/{len(file_paths)} files...")
+    with st.spinner(f"Validating {len(new_items)} file(s)..."):
+        progress_bar = st.progress(0, text=f"Validating 0/{len(new_items)} files...")
 
-        for i, file_path in enumerate(file_paths, 1):
+        for i, file_path in enumerate(new_items, 1):
             file_info = validate_and_get_info(file_path)
             st.session_state.pending_files.append(file_info)
+            if first_appended is None:
+                first_appended = file_info
             if file_info.is_valid:
                 valid_count += 1
-            progress_bar.progress(i / len(file_paths), text=f"Validating {i}/{len(file_paths)} files...")
+            progress_bar.progress(i / len(new_items), text=f"Validating {i}/{len(new_items)} files...")
 
         progress_bar.empty()
 
         if valid_count == 0:
             st.error("❌ No valid files found")
-            if st.session_state.pending_files:
-                first = st.session_state.pending_files[-len(file_paths)]
-                if first.error_message:
-                    st.caption(f"First error: {first.error_message}")
-                st.caption(f"Path tried: `{first.path}`")
-        elif valid_count < len(file_paths):
-            st.warning(f"⚠️ Loaded {valid_count}/{len(file_paths)} valid files")
+            if first_appended is not None:
+                if first_appended.error_message:
+                    st.caption(f"First error: {first_appended.error_message}")
+                st.caption(f"Path tried: `{first_appended.path}`")
+        elif valid_count < len(new_items):
+            st.warning(f"⚠️ Loaded {valid_count}/{len(new_items)} valid files")
         else:
             st.success(f"✅ All {valid_count} files are valid")
 
@@ -1622,7 +1649,7 @@ def show_cross_archive_analysis():
         })
     
     df = pd.DataFrame(analysis_rows)
-    st.dataframe(df, hide_index=True, use_container_width=True)
+    st.dataframe(df, hide_index=True, width="stretch")
     
     # Show overlap matrix
     if len(files_by_source) <= 10:  # Only show matrix for reasonable number of sources
@@ -1641,7 +1668,7 @@ def show_cross_archive_analysis():
                 matrix_data.append(row)
             
             matrix_df = pd.DataFrame(matrix_data)
-            st.dataframe(matrix_df.set_index('Archive'), use_container_width=True)
+            st.dataframe(matrix_df.set_index('Archive'), width="stretch")
 
 
 def show_full_inventory():
@@ -1705,7 +1732,7 @@ def show_full_inventory():
     
     # Preview
     with st.expander("👀 Preview Inventory", expanded=False):
-        st.dataframe(df.head(100), hide_index=True, use_container_width=True)
+        st.dataframe(df.head(100), hide_index=True, width="stretch")
         if len(df) > 100:
             st.info(f"Showing first 100 of {len(df):,} files")
 
@@ -1713,14 +1740,20 @@ def show_full_inventory():
 def process_uploaded_files(uploaded_files):
     """Process files uploaded through Streamlit's file uploader."""
     import tempfile
-    import shutil
-    
+
     if not uploaded_files:
         return
-    
+
+    # Clean up temp dirs left behind by previous uploads. This bounds the
+    # leak at one directory instead of one per upload — see the `finally`
+    # block below for why we can't clean up *this* upload's dir here too.
+    remove_dirs(st.session_state.upload_dirs)
+    st.session_state.upload_dirs = []
+
     # Create temp directory for uploads
     temp_dir = Path(tempfile.mkdtemp(prefix='takeout_scout_'))
-    
+    st.session_state.upload_dirs.append(temp_dir)
+
     try:
         with st.spinner(f"Processing {len(uploaded_files)} uploaded file(s)..."):
             file_paths = []
