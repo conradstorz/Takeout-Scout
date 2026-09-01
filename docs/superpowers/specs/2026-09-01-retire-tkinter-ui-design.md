@@ -71,10 +71,26 @@ The *Legacy Tkinter Version* section (lines 99–106) goes with the file.
 ### 3. `README.md` describes a structure that predates the package split
 
 The *Project Structure* block lists `app.py` and `ts.py` at top level and omits
-`takeout_scout/`, `tests/`, `run_app.py`, `requirements.txt` and `uv.lock`. It
-is rewritten against the actual tree.
+`takeout_scout/`, `tests/`, `run_app.py` and `requirements.txt`. It is rewritten
+against the actual tree. (`uv.lock` is untracked and stays out of the diagram.)
 
-### 4. Two other documents reference the deleted file
+### 4. `README.md` describes a button that will not exist
+
+The Logging section ends:
+
+> Access logs via the "Open Logs..." button in the GUI.
+
+That button is `ts.py`'s `on_open_logs`. `app.py` has no equivalent —
+`grep -n "Open Logs" app.py` returns nothing — so the sentence is arguably
+already false for the web interface, and is unambiguously false once `ts.py`
+is gone. It is deleted; the rotation sentence before it stays.
+
+**Found after this spec was first written**, by reading the README end to end
+instead of grepping for `ts.py`. It is the one reference that never names the
+file, which is why the grep missed it and why the new test cannot see it
+either — it is prose, not a command.
+
+### 5. Two other documents reference the deleted file
 
 - `DISCOVERY_TRACKING.md` lines 11, 26 and 260 — a directory diagram, a
   sentence about where files are written, and a compatibility note claiming
@@ -116,25 +132,32 @@ Defect 2 does need one. A merge shipped a documented command that could never
 execute, and nothing in the repository noticed. Add `tests/test_docs.py`:
 
 > Every path that looks like a file in this repository, appearing inside a
-> fenced shell block in a tracked Markdown file, must exist on disk.
+> fenced shell block in reader-facing documentation, must exist on disk.
 
 Scope it deliberately. "Fenced shell block" means a fence opened as ```bash
 or ```sh only — a bare ``` fence is excluded, which is what keeps the
 ASCII-art *Project Structure* tree out of the test's reach. Within those
 blocks it matches tokens ending in `.py`, `.toml`, `.md` or `.json`, and skips
-anything containing a URL scheme, a shell variable, or a wildcard. It is a spell-checker for commands, not a shell parser, and it must
-not become one.
+anything containing a URL scheme, a shell variable, or a wildcard. It is a
+spell-checker for commands, not a shell parser, and it must not become one.
 
-This is the repository's only test that covers documentation, which is where
-both merge defects landed.
+**Amended during planning: "reader-facing", not "tracked".** `docs/superpowers/`
+is excluded. This document and its plan both quote `streamlit run ts.py` as the
+record of what was fixed; under a repository-wide rule the guard would go red
+the moment `ts.py` is deleted, and the only route back to green would be
+deleting the history the test exists to protect. Reader-facing documentation is
+what has to be executable, and it is where every defect above landed.
+
+This is the repository's only test that covers documentation.
 
 ## Verification
 
 1. The full test suite passes, with the same count as before the change plus
    the new documentation test. An unchanged count for the pre-existing tests is
    the evidence that deleting `ts.py` was inert.
-2. `uv run takeout-scout` starts the Streamlit app.
-3. `git grep -n "ts\.py"` returns nothing.
+2. `app.py` parses and `run_app.main` imports, so the console script resolves.
+3. `git grep -n "ts\.py" -- ":!docs/"` returns nothing. `docs/` is excluded
+   because this spec and its plan quote the removed file deliberately.
 
 ## Deferred
 
