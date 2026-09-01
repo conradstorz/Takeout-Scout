@@ -253,6 +253,61 @@ class TestHashIndex:
         # (The inner lists are shared by a shallow copy; this test only
         # pins the contract that matters to callers — the top-level dict.)
 
+    def test_merge_into_empty_index(self):
+        """Merging a populated index into an empty one gives the empty one
+        all its entries."""
+        source = HashIndex()
+        source.add('hash1', '/a.zip', 'p1.jpg', 1000)
+        source.add('hash2', '/b.zip', 'p2.jpg', 2000)
+
+        target = HashIndex()
+        target.merge(source)
+
+        assert target.get_hash('/a.zip', 'p1.jpg') == 'hash1'
+        assert target.get_hash('/b.zip', 'p2.jpg') == 'hash2'
+
+    def test_merge_shared_hash_stays_a_duplicate(self):
+        """Merging two indexes that share a hash keeps both locations under
+        that hash, so a file present in two archives is still discoverable
+        as a duplicate afterwards. This is the reason merge exists."""
+        first = HashIndex()
+        first.add('same_hash', '/archive1.zip', 'photo.jpg', 1000)
+
+        second = HashIndex()
+        second.add('same_hash', '/archive2.zip', 'photo.jpg', 1000)
+
+        first.merge(second)
+
+        duplicates = first.get_duplicates('same_hash')
+        assert len(duplicates) == 2
+
+    def test_merge_empty_index_changes_nothing(self):
+        """Merging an empty index changes nothing."""
+        target = HashIndex()
+        target.add('hash1', '/a.zip', 'p1.jpg', 1000)
+
+        target.merge(HashIndex())
+
+        assert target.entries() == {'hash1': [('/a.zip', 'p1.jpg', 1000)]}
+
+    def test_merge_returns_none_and_leaves_other_unmodified(self):
+        """merge returns None and mutates in place — the receiver gains
+        entries and `other` is left unmodified."""
+        target = HashIndex()
+        target.add('hash1', '/a.zip', 'p1.jpg', 1000)
+
+        other = HashIndex()
+        other.add('hash2', '/b.zip', 'p2.jpg', 2000)
+
+        result = target.merge(other)
+
+        assert result is None
+        assert other.entries() == {'hash2': [('/b.zip', 'p2.jpg', 2000)]}
+        assert target.entries() == {
+            'hash1': [('/a.zip', 'p1.jpg', 1000)],
+            'hash2': [('/b.zip', 'p2.jpg', 2000)],
+        }
+
 
 class TestSummarizeSources:
     """Tests for the summarize_sources function.

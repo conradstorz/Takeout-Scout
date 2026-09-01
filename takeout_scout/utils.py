@@ -69,6 +69,42 @@ def partition_known_paths(
     return new, already
 
 
+def unreferenced_dirs(
+    dirs: Iterable[Path],
+    in_use: Iterable[str],
+) -> list[Path]:
+    """Directories from `dirs` that no path in `in_use` lives under.
+
+    Used to clean up temp directories from earlier uploads without deleting
+    one whose files are still queued for scanning. A directory is referenced
+    if any in-use path is the directory itself or sits beneath it.
+
+    Order is preserved, and a directory appearing twice is returned once.
+    """
+    in_use_paths = [Path(p).resolve() for p in in_use]
+
+    result: list[Path] = []
+    seen: set[Path] = set()
+
+    for d in dirs:
+        resolved = d.resolve()
+        if resolved in seen:
+            continue
+
+        # `Path.is_relative_to` performs a segment-wise comparison, not a
+        # string prefix match, so "/tmp/scout_a" does not falsely count as
+        # containing "/tmp/scout_ab/x".
+        referenced = any(
+            used == resolved or used.is_relative_to(resolved)
+            for used in in_use_paths
+        )
+        if not referenced:
+            result.append(d)
+            seen.add(resolved)
+
+    return result
+
+
 def remove_dirs(paths: Iterable[Path]) -> tuple[list[Path], list[tuple[Path, str]]]:
     """Delete directories, returning (removed, failures). Never raises.
 

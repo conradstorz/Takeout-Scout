@@ -178,3 +178,21 @@ def test_iter_file_details_yields_objects_not_dicts() -> None:
         f"{type(hydrated[0])!r}"
     )
     assert hydrated[0].file_type == "photo"
+
+
+def test_root_level_files_do_not_become_an_album() -> None:
+    """A file at the archive root has no folder; '.' is not an album name.
+
+    Uses "Vacation" rather than "Photos" as the real album name: "photos"
+    (and "google photos", "takeout", "archive") are stop words the filter
+    already excludes on purpose, so a folder named "Photos" would not prove
+    anything about the "." fix either way.
+    """
+    module = importlib.import_module("app")
+
+    result = module.analyze_file_structure(
+        ["root.jpg", "Takeout/Google Photos/Vacation/a.jpg"], "t.zip"
+    )
+
+    assert "." not in result.albums
+    assert "Vacation" in result.albums

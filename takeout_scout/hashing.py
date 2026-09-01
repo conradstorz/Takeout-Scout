@@ -245,7 +245,7 @@ class HashIndex:
         """Merge another HashIndex into this one."""
         for file_hash, files in other._by_hash.items():
             for source_path, file_path, size in files:
-                index.add(file_hash, source_path, file_path, size)
+                self.add(file_hash, source_path, file_path, size)
 
 
 def summarize_sources(

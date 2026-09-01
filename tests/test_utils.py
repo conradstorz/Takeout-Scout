@@ -4,7 +4,12 @@ Tests for takeout_scout.utils module.
 from pathlib import Path
 
 import pytest
-from takeout_scout.utils import human_size, partition_known_paths, remove_dirs
+from takeout_scout.utils import (
+    human_size,
+    partition_known_paths,
+    remove_dirs,
+    unreferenced_dirs,
+)
 
 
 class TestHumanSize:
@@ -122,3 +127,62 @@ class TestRemoveDirs:
         removed, failures = remove_dirs([])
         assert removed == []
         assert failures == []
+
+
+class TestUnreferencedDirs:
+    """Tests for the unreferenced_dirs function."""
+
+    def test_dir_with_no_in_use_path_under_it_is_unreferenced(self, tmp_path):
+        """A directory with no in-use path under it is returned."""
+        stale = tmp_path / "scout_stale"
+        stale.mkdir()
+
+        result = unreferenced_dirs([stale], in_use={str(tmp_path / "elsewhere" / "f.zip")})
+
+        assert result == [stale]
+
+    def test_dir_containing_an_in_use_path_is_not_returned(self, tmp_path):
+        """A directory containing an in-use path is not returned."""
+        active = tmp_path / "scout_active"
+        active.mkdir()
+        in_use_path = active / "a.zip"
+
+        result = unreferenced_dirs([active], in_use={str(in_use_path)})
+
+        assert result == []
+
+    def test_shared_name_prefix_does_not_count_as_containment(self, tmp_path):
+        """A directory whose name is a prefix of another directory's name,
+        where only the *other* one holds an in-use path, is still returned.
+
+        This is the containment trap: string prefix matching would wrongly
+        treat "scout_a" as containing "scout_ab/x" because "scout_a" is a
+        string prefix of "scout_ab". Path.is_relative_to must not be fooled
+        by this — the two are siblings, not parent and child.
+        """
+        prefix_dir = tmp_path / "scout_a"
+        prefix_dir.mkdir()
+        other_dir = tmp_path / "scout_ab"
+        other_dir.mkdir()
+        in_use_path = other_dir / "x"
+
+        result = unreferenced_dirs([prefix_dir, other_dir], in_use={str(in_use_path)})
+
+        assert result == [prefix_dir]
+
+    def test_empty_in_use_returns_every_dir(self, tmp_path):
+        """Empty in_use means every directory is unreferenced."""
+        dir1 = tmp_path / "dir1"
+        dir2 = tmp_path / "dir2"
+        dir1.mkdir()
+        dir2.mkdir()
+
+        result = unreferenced_dirs([dir1, dir2], in_use=set())
+
+        assert result == [dir1, dir2]
+
+    def test_empty_dirs_returns_empty_list(self, tmp_path):
+        """Empty dirs produces an empty list."""
+        result = unreferenced_dirs([], in_use={str(tmp_path / "f.zip")})
+
+        assert result == []

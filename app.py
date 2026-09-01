@@ -39,7 +39,7 @@ from takeout_scout import (
     HashIndex,
     summarize_sources,
 )
-from takeout_scout.utils import partition_known_paths, remove_dirs
+from takeout_scout.utils import partition_known_paths, remove_dirs, unreferenced_dirs
 from takeout_scout.constants import ensure_directories
 from takeout_scout.logging import logger
 from takeout_scout.discovery import load_takeout_discovery
@@ -993,6 +993,11 @@ def analyze_file_structure(members: List[str], base_path: str, progress_callback
 
         folder_parts = folder.split('/')
         for part in folder_parts:
+            # '.' is what Path(...).parent gives a root-level member — the
+            # absence of a folder, not a folder named '.' — so skip it like
+            # an empty part rather than let it register as an album.
+            if part in ("", "."):
+                continue
             if part and not part.isdigit() and part.lower() not in {'google photos', 'takeout', 'photos', 'archive'}:
                 if not re.match(r'^\d{4}$', part):
                     albums.add(part)
@@ -1735,11 +1740,19 @@ def process_uploaded_files(uploaded_files):
     if not uploaded_files:
         return
 
-    # Clean up temp dirs left behind by previous uploads. This bounds the
-    # leak at one directory instead of one per upload — see the `finally`
+    # Clean up temp dirs left behind by previous uploads — but only ones
+    # nothing still points at. Uploaded files aren't scanned immediately;
+    # they're queued in pending_files until the user clicks Scan All, so an
+    # earlier upload's directory can still be referenced when a later one
+    # arrives. Deleting it unconditionally (the previous fix for the leak)
+    # traded the leak for silently losing queued files. See the `finally`
     # block below for why we can't clean up *this* upload's dir here too.
-    remove_dirs(st.session_state.upload_dirs)
-    st.session_state.upload_dirs = []
+    in_use = {str(f.path) for f in st.session_state.pending_files}
+    stale = unreferenced_dirs(st.session_state.upload_dirs, in_use)
+    remove_dirs(stale)
+    st.session_state.upload_dirs = [
+        d for d in st.session_state.upload_dirs if d not in stale
+    ]
 
     # Create temp directory for uploads
     temp_dir = Path(tempfile.mkdtemp(prefix='takeout_scout_'))
