@@ -2,8 +2,9 @@
 """
 Takeout Scout launcher.
 
-Starts the Streamlit web interface (app.py). Named run_app.py, not
-takeout_scout.py, so it cannot shadow the takeout_scout/ package.
+Starts the Streamlit web interface (app.py). Lives inside the takeout_scout/
+package so it ships in the wheel and the takeout-scout console script can
+find it after a non-editable install.
 """
 import sys
 import subprocess

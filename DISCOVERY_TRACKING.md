@@ -7,7 +7,8 @@ The Takeout Scout now includes a comprehensive discovery tracking system that pe
 
 ```
 Takeout-Scout/
-├── app.py
+├── takeout_scout/
+│   └── app.py
 ├── discoveries_index.json          # Main index of all discoveries
 ├── takeouts_discovered/            # Directory containing individual takeout records
 │   ├── MyTakeout_a1b2c3d4e5f6.takeout_scout
