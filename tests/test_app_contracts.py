@@ -196,3 +196,36 @@ def test_root_level_files_do_not_become_an_album() -> None:
 
     assert "." not in result.albums
     assert "Vacation" in result.albums
+
+
+def test_root_level_files_do_not_become_a_folder() -> None:
+    """A root-level member is not recorded as folder '.' in folder_structure,
+    but a real folder still is, and the root file still counts toward the
+    totals that are actually built from every member (here: unpaired_photos),
+    proving the exclusion only touches the folder tally.
+    """
+    module = importlib.import_module("app")
+
+    result = module.analyze_file_structure(
+        ["root.jpg", "Takeout/Google Photos/Vacation/a.jpg"], "t.zip"
+    )
+
+    assert "." not in result.folder_structure
+    assert result.folder_structure["Takeout/Google Photos/Vacation"] == 1
+    # Both photos are unpaired (no matching .json for either) — the
+    # root-level file is still counted here even though it left no trace
+    # in folder_structure.
+    assert result.unpaired_photos == 2
+
+
+def test_clean_file_path_strips_windows_copy_as_path_quotes() -> None:
+    """clean_file_path strips the quotes Windows adds to "Copy as path",
+    which README.md:106 tells users to use. This covers the helper only —
+    the three Streamlit call sites that now route through it (the "Up"
+    button, subfolder browsing, and "Load Pasted Folder") have no test
+    harness and are verified by inspection.
+    """
+    module = importlib.import_module("app")
+
+    quoted = '"C:\\Users\\test\\Takeout"'
+    assert module.clean_file_path(quoted) == "C:\\Users\\test\\Takeout"

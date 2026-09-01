@@ -164,7 +164,9 @@ def save_recent_folders(folders: List[str]) -> None:
 def add_recent_folder(folder_path: str) -> None:
     """Add a folder to recent folders list."""
     recent = st.session_state.recent_folders
-    folder_path = str(Path(folder_path).resolve())
+    # Defensive: every current caller already passes a cleaned str(Path), but
+    # this keeps add_recent_folder safe on its own if that ever changes.
+    folder_path = str(Path(clean_file_path(folder_path)).resolve())
     
     # Remove if already in list
     if folder_path in recent:
@@ -360,14 +362,14 @@ def main():
             with col2:
                 # Parent directory navigation
                 if st.button("⬆️ Up", width="stretch"):
-                    current = Path(folder_path) if folder_path else st.session_state.current_browse_path
+                    current = Path(clean_file_path(folder_path)) if folder_path else st.session_state.current_browse_path
                     if current.parent != current:
                         st.session_state.current_browse_path = current.parent
                         st.rerun()
-            
+
             # Browse current directory
             if folder_path:
-                browse_path = Path(folder_path)
+                browse_path = Path(clean_file_path(folder_path))
                 if browse_path.exists() and browse_path.is_dir():
                     with st.expander("📂 Browse subfolders", expanded=False):
                         try:
@@ -404,9 +406,13 @@ def main():
                 if folder_path_paste and st.button("📁 Load Pasted Folder", type="primary", width="stretch"):
                     cleaned_path = clean_file_path(folder_path_paste)
                     path_obj = Path(cleaned_path)
-                    if path_obj.exists():
+                    if not path_obj.exists():
+                        st.error(f"❌ Path not found: `{path_obj}`")
+                    elif not path_obj.is_dir():
+                        st.error(f"❌ Not a folder: `{path_obj}`")
+                    else:
                         add_recent_folder(str(path_obj))
-                    load_folder(path_obj)
+                        load_folder(path_obj)
             else:
                 st.info("💡 One path per line")
                 file_paths_text = st.text_area(
@@ -704,6 +710,9 @@ def load_folder(folder_path: Path):
         st.caption(f"Resolved path: `{folder_path.resolve()}`")
         return
 
+    known = set(st.session_state.scanned_paths)
+    known.update(str(f.path) for f in st.session_state.pending_files)
+
     with st.spinner(f"Searching {folder_path.name}..."):
         archives, directories = find_archives_and_dirs(folder_path)
     all_items = list(archives) + list(directories)
@@ -711,13 +720,14 @@ def load_folder(folder_path: Path):
     if not all_items:
         st.warning(f"⚠️ No archives or Takeout directories found in {folder_path}")
         # Still validate the folder itself
+        if str(folder_path) in known:
+            st.info("ℹ️ Already queued or already scanned")
+            return
         file_info = validate_and_get_info(folder_path)
         st.session_state.pending_files.append(file_info)
         st.rerun()
         return
 
-    known = set(st.session_state.scanned_paths)
-    known.update(str(f.path) for f in st.session_state.pending_files)
     new_items, already = partition_known_paths(all_items, known)
 
     if already:
@@ -839,13 +849,16 @@ def _update_hash_index(path: Path):
 
         for file_detail in discovery.file_details:
             file_hash = file_detail.get('file_hash')
-            if file_hash:
-                st.session_state.hash_index.add(
-                    file_hash,
-                    discovery.source_path,
-                    file_detail.get('path'),
-                    file_detail.get('size', 0),
-                )
+            file_path = file_detail.get('path')
+            if not file_hash or not file_path:
+                continue
+            try:
+                size = int(file_detail.get('size', 0) or 0)
+            except (TypeError, ValueError):
+                size = 0
+            st.session_state.hash_index.add(
+                file_hash, discovery.source_path, file_path, size
+            )
     except Exception as e:
         logger.warning(f"Failed to update hash index: {e}")
 
@@ -989,7 +1002,13 @@ def analyze_file_structure(members: List[str], base_path: str, progress_callback
 
         member_lower = member.lower()
         folder = str(Path(member).parent).replace("\\", "/")
-        folder_structure[folder] += 1
+        # '.' is what Path(...).parent gives a root-level member — the
+        # absence of a folder, not a folder named '.' — so it must not be
+        # recorded as one here. The root-level file itself still counts
+        # toward every other total (pairing, year, date); only the folder
+        # tally excludes it.
+        if folder != ".":
+            folder_structure[folder] += 1
 
         folder_parts = folder.split('/')
         for part in folder_parts:
@@ -1555,12 +1574,18 @@ def show_orphan_analysis():
             if not discovery:
                 continue
             
+            # Materialise once: iter_file_details() constructs a FileDetails
+            # per yield, so walking it four times (two set comprehensions,
+            # two loops) meant four full object-construction passes over
+            # every file in the archive.
+            details = list(discovery.iter_file_details())
+
             # Build sets for lookup
-            json_files = {fd.path for fd in discovery.iter_file_details() if fd.file_type == 'json'}
-            media_files = {fd.path for fd in discovery.iter_file_details() if fd.file_type in ('photo', 'video')}
+            json_files = {fd.path for fd in details if fd.file_type == 'json'}
+            media_files = {fd.path for fd in details if fd.file_type in ('photo', 'video')}
 
             # Check each media file for sidecar
-            for fd in discovery.iter_file_details():
+            for fd in details:
                 if fd.file_type in ('photo', 'video'):
                     expected_sidecar = f"{fd.path}.json"
                     if expected_sidecar in json_files or fd.sidecar_path:
@@ -1573,7 +1598,7 @@ def show_orphan_analysis():
                         })
 
             # Check each JSON for matching media
-            for fd in discovery.iter_file_details():
+            for fd in details:
                 if fd.file_type == 'json' and fd.path.endswith('.json'):
                     # Expected media path: remove .json suffix
                     if fd.path.endswith('.json'):
