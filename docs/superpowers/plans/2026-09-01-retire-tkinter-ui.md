@@ -478,7 +478,11 @@ Expected: a line like `<function main at 0x...>`
 
 - [ ] **Step 10: Commit**
 
-Run: `git add -A README.md ts.py`
+Run: `git add README.md`
+
+Step 1's `git rm` already staged the deletion. Naming `ts.py` here would fail
+with `fatal: pathspec 'ts.py' did not match any files`, because the file no
+longer exists on disk to be matched.
 
 Then commit. Use repeated `-m` flags for the paragraphs — **do not use a
 heredoc.** Heredocs fail to parse in this project's shell when the body
