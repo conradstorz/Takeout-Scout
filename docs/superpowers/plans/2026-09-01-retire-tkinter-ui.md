@@ -17,7 +17,8 @@
 - Do not chain shell commands with `&&`. Issue them separately.
 - Do not modify `app.py` or anything under `takeout_scout/`. This plan touches documentation, one deleted file, and one new test file.
 - Do not tidy untracked files. `logs/`, `state/`, `takeouts_discovered/`, `discoveries_index.json`, `__pycache__/` and `.venv/` stay exactly as they are.
-- The pre-existing suite is **170 passing tests**. That number must not change. A change in it means the deletion was not inert, and is a stop-and-report condition.
+- The pre-existing suite is **170 passing tests**. That number must not change. A change in it means the deletion was not inert, and is a stop-and-report condition. Do not pin the *total* — the new guard adds one parametrized case per Markdown file found on disk, including untracked ones such as `MERGE_REPORT.md`, so the total is derived and may legitimately differ from any number written here.
+- `MERGE_REPORT.md` is untracked and stays untracked. It contains no code fences, so the new guard collects it and finds nothing to check. Do not delete it, do not commit it.
 - The README's positioning paragraph must not claim Scout uses `Takeout_Inventory`. It does not — `git grep -n "takeout_inventory"` returns nothing. Stating an intended architecture as a current one is the specific error this plan exists to avoid repeating.
 
 ---
@@ -234,10 +235,19 @@ Run: `rm scratch_mutate.py`
 
 Run: `uv run pytest -q`
 
-Expected: PASS. The pre-existing count is 170; the new file adds 3 fixed tests
-plus one parametrized case per reader-facing Markdown file (currently
-`README.md`, `DISCOVERY_TRACKING.md`, `METADATA_FEATURES.md` = 3), so expect
-**176 passed**.
+Expected: PASS.
+
+**Do not pin the total.** The new file adds 3 fixed tests plus one
+parametrized case per reader-facing Markdown file *present on disk*, tracked
+or not. At the time of writing that is four — `README.md`,
+`DISCOVERY_TRACKING.md`, `METADATA_FEATURES.md`, and the untracked
+`MERGE_REPORT.md` — giving **177 passed**. If your working tree holds a
+different set of Markdown files the total moves, and that is correct
+behaviour, not a failure.
+
+**The binding assertion is that all 170 pre-existing tests still pass**, and
+that every new test passes. Record whatever total you observe in your report
+so later tasks can compare against it.
 
 - [ ] **Step 5: Commit**
 
@@ -414,8 +424,9 @@ wired together, and on that day it is one sentence to edit.
 
 Run: `uv run pytest -q`
 
-Expected: **176 passed**. Same count as the end of Task 1 — the parametrized
-case count is unchanged because no Markdown file was added or removed.
+Expected: all pass, at **the same total Task 1's report recorded** — no
+Markdown file was added or removed, so the parametrized case count is
+unchanged. The 170 pre-existing tests must still be among the passes.
 
 - [ ] **Step 9: Verify the app is still intact and the launcher resolves**
 
@@ -557,7 +568,8 @@ purpose, as the record of what was changed.
 
 Run: `uv run pytest -q`
 
-Expected: **176 passed**.
+Expected: all pass, at the same total the earlier tasks recorded. The 170
+pre-existing tests must still be among them.
 
 - [ ] **Step 7: Commit**
 
@@ -569,7 +581,7 @@ Run: `git commit -m "docs: drop the last references to the removed Tkinter UI"`
 
 ## Definition of done
 
-1. `uv run pytest -q` reports **176 passed** — the original 170 unchanged, plus 6 from the new guard.
+1. `uv run pytest -q` passes, with the original **170 unchanged** plus the new guard's tests (3 fixed, plus one parametrized case per reader-facing Markdown file on disk — 4 at time of writing, so 177 total). The 170 is the binding number; the total moves with the Markdown file list.
 2. `git grep -n "ts\.py" -- ":!docs/"` returns nothing.
 3. `ts.py` does not exist.
 4. `README.md` names `app.py` in both Usage commands, carries the "Where this fits" paragraph, and its Project Structure block lists `takeout_scout/`, `tests/` and `run_app.py`.
