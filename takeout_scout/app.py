@@ -1838,8 +1838,11 @@ if __name__ == '__main__':
 
             script_path = Path(__file__).resolve()
             cmd = [_sys.executable, "-m", "streamlit", "run", str(script_path)] + _sys.argv[1:]
-            subprocess.run(cmd)
-            _sys.exit(0)
+            # Propagate Streamlit's exit code. Exiting 0 unconditionally would
+            # report success to a shell or supervisor even when Streamlit
+            # failed to start — cli.py next door already gets this right.
+            completed = subprocess.run(cmd)
+            _sys.exit(completed.returncode)
     except ImportError:
         pass
 

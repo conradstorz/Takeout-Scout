@@ -1,5 +1,5 @@
 """
-Contract tests for app.py.
+Contract tests for takeout_scout/app.py.
 
 Nothing else in the suite imports app.py — it is the repository's only user
 interface (~1,900 lines of Streamlit) and it is otherwise untested. These
@@ -26,7 +26,7 @@ def test_app_module_imports() -> None:
     exist, so importing it here (and possibly more than once, across test
     runs) is safe and does not require mocking Streamlit.
     """
-    module = importlib.import_module("app")
+    module = importlib.import_module("takeout_scout.app")
     assert module is not None
 
 
@@ -67,7 +67,7 @@ def _collect_known_object_attr_accesses(source: str):
 
 
 def _app_source() -> str:
-    app_path = Path(__file__).resolve().parent.parent / "app.py"
+    app_path = Path(__file__).resolve().parent.parent / "takeout_scout" / "app.py"
     return app_path.read_text(encoding="utf-8")
 
 
@@ -188,7 +188,7 @@ def test_root_level_files_do_not_become_an_album() -> None:
     already excludes on purpose, so a folder named "Photos" would not prove
     anything about the "." fix either way.
     """
-    module = importlib.import_module("app")
+    module = importlib.import_module("takeout_scout.app")
 
     result = module.analyze_file_structure(
         ["root.jpg", "Takeout/Google Photos/Vacation/a.jpg"], "t.zip"
@@ -204,7 +204,7 @@ def test_root_level_files_do_not_become_a_folder() -> None:
     totals that are actually built from every member (here: unpaired_photos),
     proving the exclusion only touches the folder tally.
     """
-    module = importlib.import_module("app")
+    module = importlib.import_module("takeout_scout.app")
 
     result = module.analyze_file_structure(
         ["root.jpg", "Takeout/Google Photos/Vacation/a.jpg"], "t.zip"
@@ -225,7 +225,7 @@ def test_clean_file_path_strips_windows_copy_as_path_quotes() -> None:
     button, subfolder browsing, and "Load Pasted Folder") have no test
     harness and are verified by inspection.
     """
-    module = importlib.import_module("app")
+    module = importlib.import_module("takeout_scout.app")
 
     quoted = '"C:\\Users\\test\\Takeout"'
     assert module.clean_file_path(quoted) == "C:\\Users\\test\\Takeout"

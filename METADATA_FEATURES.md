@@ -47,7 +47,7 @@ Metadata can be extracted from photos in:
 
 ### 4. Updated Display Columns
 
-#### Web UI (app.py)
+#### Web UI (takeout_scout/app.py)
 New columns in the table view:
 - **w/EXIF**: Count of photos with EXIF data
 - **w/GPS**: Count of photos with GPS coordinates

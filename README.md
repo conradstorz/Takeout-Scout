@@ -79,12 +79,12 @@ pip install -e ".[full]"
 
 Run the web application:
 ```bash
-streamlit run app.py
+streamlit run takeout_scout/app.py
 ```
 
 Or use uv:
 ```bash
-uv run streamlit run app.py
+uv run streamlit run takeout_scout/app.py
 ```
 
 Or use the convenience launcher (after installation):
@@ -119,9 +119,9 @@ The app will automatically open in your default web browser at `http://localhost
 
 ```
 Takeout-Scout/
-├── app.py                     # Streamlit web application
-├── run_app.py                 # Launcher: starts Streamlit on app.py
-├── takeout_scout/             # Scanning engine (importable package)
+├── takeout_scout/             # Scanning engine + UI (importable package)
+│   ├── app.py                 # Streamlit web application
+│   ├── cli.py                 # Launcher: starts Streamlit on app.py
 │   ├── scanner.py             # Archive and directory scanning
 │   ├── sidecar.py             # Google Takeout JSON sidecar parsing
 │   ├── hashing.py             # File hashing utilities
