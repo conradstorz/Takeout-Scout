@@ -104,8 +104,9 @@ CHECKED_SUFFIXES = (".py", ".toml", ".md", ".json")
 # mean interpreting the shell. Skip rather than guess.
 SKIP_MARKERS = ("://", "$", "*", "?", '"', "'", "<", ">", "=")
 
-# Directories holding no reader-facing documentation.
-EXCLUDED_DIRS = {".venv", ".git", "node_modules", "__pycache__", "site-packages"}
+# Directories holding no reader-facing documentation. Kept alongside the
+# dot-component rule below because neither of these begins with a dot.
+EXCLUDED_DIRS = {"node_modules", "site-packages"}
 
 # docs/superpowers/ is process history - specs and plans quote commands from
 # before and after a change on purpose. Holding them to this rule would mean
@@ -114,10 +115,18 @@ EXCLUDED_PREFIX = ("docs", "superpowers")
 
 
 def _markdown_files() -> list[Path]:
-    """Reader-facing Markdown, excluding process history and vendored trees."""
+    """Reader-facing Markdown, excluding process history and vendored trees.
+
+    Anything under a dot-directory (.venv, .git, .pytest_cache,
+    .superpowers, ...) is process or tool scratch, never reader-facing
+    documentation, so a single rule - skip any path with a dot-prefixed
+    component - replaces what used to be a growing denylist.
+    """
     found = []
     for path in REPO_ROOT.rglob("*.md"):
         parts = path.relative_to(REPO_ROOT).parts
+        if any(part.startswith(".") for part in parts):
+            continue
         if EXCLUDED_DIRS & set(parts):
             continue
         if parts[: len(EXCLUDED_PREFIX)] == EXCLUDED_PREFIX:
@@ -170,10 +179,15 @@ def test_readme_shell_blocks_yield_paths() -> None:
     )
 
 
-def test_superpowers_docs_are_excluded() -> None:
+def test_superpowers_docs_and_dot_dirs_are_excluded() -> None:
     """The exclusion is deliberate, not an accident of the glob."""
     collected = {path.relative_to(REPO_ROOT).as_posix() for path in _markdown_files()}
     assert not any(name.startswith("docs/superpowers/") for name in collected)
+    assert not any(
+        part.startswith(".")
+        for name in collected
+        for part in name.split("/")
+    )
 
 
 @pytest.mark.parametrize(
