@@ -30,6 +30,10 @@ CHECKED_SUFFIXES = (".py", ".toml", ".md", ".json")
 # mean interpreting the shell. Skip rather than guess.
 SKIP_MARKERS = ("://", "$", "*", "?", '"', "'", "<", ">", "=")
 
+# A token after a redirect is an output the command creates, not an input
+# that must already exist. Checking it would fail on correct commands.
+REDIRECT_OPERATORS = {">", ">>", "1>", "2>", "&>", "2>>"}
+
 # Directories holding no reader-facing documentation. Kept alongside the
 # dot-component rule below because neither of these begins with a dot.
 EXCLUDED_DIRS = {"node_modules", "site-packages"}
@@ -77,7 +81,10 @@ def _shell_block_lines(text: str):
 
 def _candidate_paths(line: str):
     """Yield tokens from one shell line that look like repository files."""
-    for raw in line.split():
+    tokens = line.split()
+    for index, raw in enumerate(tokens):
+        if index > 0 and tokens[index - 1] in REDIRECT_OPERATORS:
+            continue
         token = raw.strip("`,;:()[]")
         if any(marker in token for marker in SKIP_MARKERS):
             continue
@@ -103,6 +110,23 @@ def test_readme_shell_blocks_yield_paths() -> None:
     assert any(token.endswith(".py") for token in found), (
         f"extractor found no Python paths in README shell blocks: {sorted(found)}"
     )
+
+
+def test_redirect_targets_are_not_checked() -> None:
+    """An output a command creates must not be treated as a required input.
+
+    Whitespace-splitting happens before the SKIP_MARKERS check, so a spaced
+    redirect (`> report.json`) puts the `>` on its own token and leaves the
+    target token with no marker to skip on. The no-space form (`2>report.json`)
+    already contains a marker character and was never broken.
+    """
+    found = set(_candidate_paths("uv run python scan.py > report.json"))
+    assert "scan.py" in found
+    assert "report.json" not in found
+
+    found_no_space = set(_candidate_paths("uv run python scan.py 2>report.json"))
+    assert "scan.py" in found_no_space
+    assert "report.json" not in found_no_space
 
 
 def test_superpowers_docs_and_dot_dirs_are_excluded() -> None:
