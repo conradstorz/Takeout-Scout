@@ -13,11 +13,13 @@ from pathlib import Path
 
 def main():
     """Launch the Streamlit app."""
-    script_path = Path(__file__).parent / "app.py"
-    
+    # resolve() because __file__ can be relative depending on how Python was
+    # invoked, and Streamlit is handed this path as a string to open.
+    script_path = Path(__file__).resolve().parent / "app.py"
+
     # Run streamlit with the app file
     cmd = [sys.executable, "-m", "streamlit", "run", str(script_path)] + sys.argv[1:]
-    
+
     try:
         completed = subprocess.run(cmd)
     except KeyboardInterrupt:
