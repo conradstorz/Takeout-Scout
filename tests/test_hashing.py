@@ -13,6 +13,7 @@ from takeout_scout.hashing import (
     hash_zip_member,
     hash_tar_member,
     HashIndex,
+    summarize_sources,
 )
 
 
@@ -218,11 +219,144 @@ class TestHashIndex:
         """Test stats on empty index."""
         index = HashIndex()
         stats = index.get_duplicate_stats()
-        
+
         assert stats['total_files'] == 0
         assert stats['unique_hashes'] == 0
         assert stats['duplicate_sets'] == 0
         assert stats['wasted_bytes'] == 0
+
+    def test_entries_returns_full_mapping(self):
+        """entries() returns everything added, keyed by hash."""
+        index = HashIndex()
+        index.add('hash1', '/a.zip', 'p1.jpg', 1000)
+        index.add('hash2', '/b.zip', 'p2.jpg', 2000)
+
+        entries = index.entries()
+
+        assert entries == {
+            'hash1': [('/a.zip', 'p1.jpg', 1000)],
+            'hash2': [('/b.zip', 'p2.jpg', 2000)],
+        }
+
+    def test_entries_is_a_copy(self):
+        """Mutating the dict returned by entries() must not affect the index."""
+        index = HashIndex()
+        index.add('hash1', '/a.zip', 'p1.jpg', 1000)
+
+        entries = index.entries()
+        entries['hash1'].append(('/b.zip', 'p1.jpg', 1000))
+        entries['hash2'] = [('/c.zip', 'p2.jpg', 500)]
+
+        # A shallow copy: the top-level dict is independent, so a new key
+        # added to the copy does not leak into the index.
+        assert 'hash2' not in index.entries()
+        # (The inner lists are shared by a shallow copy; this test only
+        # pins the contract that matters to callers — the top-level dict.)
+
+    def test_merge_into_empty_index(self):
+        """Merging a populated index into an empty one gives the empty one
+        all its entries."""
+        source = HashIndex()
+        source.add('hash1', '/a.zip', 'p1.jpg', 1000)
+        source.add('hash2', '/b.zip', 'p2.jpg', 2000)
+
+        target = HashIndex()
+        target.merge(source)
+
+        assert target.get_hash('/a.zip', 'p1.jpg') == 'hash1'
+        assert target.get_hash('/b.zip', 'p2.jpg') == 'hash2'
+
+    def test_merge_shared_hash_stays_a_duplicate(self):
+        """Merging two indexes that share a hash keeps both locations under
+        that hash, so a file present in two archives is still discoverable
+        as a duplicate afterwards. This is the reason merge exists."""
+        first = HashIndex()
+        first.add('same_hash', '/archive1.zip', 'photo.jpg', 1000)
+
+        second = HashIndex()
+        second.add('same_hash', '/archive2.zip', 'photo.jpg', 1000)
+
+        first.merge(second)
+
+        duplicates = first.get_duplicates('same_hash')
+        assert len(duplicates) == 2
+
+    def test_merge_empty_index_changes_nothing(self):
+        """Merging an empty index changes nothing."""
+        target = HashIndex()
+        target.add('hash1', '/a.zip', 'p1.jpg', 1000)
+
+        target.merge(HashIndex())
+
+        assert target.entries() == {'hash1': [('/a.zip', 'p1.jpg', 1000)]}
+
+    def test_merge_returns_none_and_leaves_other_unmodified(self):
+        """merge returns None and mutates in place — the receiver gains
+        entries and `other` is left unmodified."""
+        target = HashIndex()
+        target.add('hash1', '/a.zip', 'p1.jpg', 1000)
+
+        other = HashIndex()
+        other.add('hash2', '/b.zip', 'p2.jpg', 2000)
+
+        result = target.merge(other)
+
+        assert result is None
+        assert other.entries() == {'hash2': [('/b.zip', 'p2.jpg', 2000)]}
+        assert target.entries() == {
+            'hash1': [('/a.zip', 'p1.jpg', 1000)],
+            'hash2': [('/b.zip', 'p2.jpg', 2000)],
+        }
+
+
+class TestSummarizeSources:
+    """Tests for the summarize_sources function.
+
+    Built over a real HashIndex populated via .add(...), never a hand-written
+    dict, so these tests pin the actual 3-tuple layout HashIndex.add
+    produces — this is what makes bug 3 (unpacking entries as 2-tuples)
+    unrepeatable.
+    """
+
+    def test_hash_in_one_source_only(self):
+        """A hash seen in a single source is unique to that source."""
+        index = HashIndex()
+        index.add('hash1', '/path/to/archive1.zip', 'photo.jpg', 1000)
+
+        files_by_source, hash_to_sources = summarize_sources(index.entries())
+
+        assert hash_to_sources['hash1'] == {'archive1.zip'}
+        assert files_by_source['archive1.zip'] == {'hash1'}
+
+    def test_hash_in_two_sources(self):
+        """A hash seen in two sources lists both, and both sources list it."""
+        index = HashIndex()
+        index.add('hash1', '/path/to/archive1.zip', 'photo.jpg', 1000)
+        index.add('hash1', '/path/to/archive2.zip', 'photo.jpg', 1000)
+
+        files_by_source, hash_to_sources = summarize_sources(index.entries())
+
+        assert hash_to_sources['hash1'] == {'archive1.zip', 'archive2.zip'}
+        assert files_by_source['archive1.zip'] == {'hash1'}
+        assert files_by_source['archive2.zip'] == {'hash1'}
+
+    def test_source_names_are_basenames(self):
+        """Sources are keyed by the basename of source_path, not the full path."""
+        index = HashIndex()
+        index.add('hash1', '/very/long/path/to/archive.zip', 'photo.jpg', 1000)
+
+        files_by_source, hash_to_sources = summarize_sources(index.entries())
+
+        assert 'archive.zip' in files_by_source
+        assert '/very/long/path/to/archive.zip' not in files_by_source
+        assert hash_to_sources['hash1'] == {'archive.zip'}
+
+    def test_empty_input(self):
+        """No entries produces two empty dicts."""
+        files_by_source, hash_to_sources = summarize_sources({})
+
+        assert files_by_source == {}
+        assert hash_to_sources == {}
 
 
 class TestScannerWithHashing:

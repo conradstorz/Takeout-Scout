@@ -7,7 +7,7 @@ for representing photos, files, media pairs, and archive summaries.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 
 @dataclass
@@ -272,6 +272,17 @@ class TakeoutDiscovery:
             media_pairs=data.get('media_pairs', []),
             notes=data.get('notes', ''),
         )
+
+    def iter_file_details(self) -> Iterator['FileDetails']:
+        """Yield file_details as FileDetails objects.
+
+        The field is stored as raw dicts so the record round-trips through JSON
+        unchanged. Callers that want attribute access go through here rather than
+        assuming the list is already hydrated - assuming it is exactly the bug
+        this method exists to prevent.
+        """
+        for raw in self.file_details:
+            yield FileDetails.from_dict(raw)
 
 
 @dataclass

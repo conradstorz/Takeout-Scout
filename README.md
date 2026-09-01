@@ -2,6 +2,12 @@
 
 A modern, web-based tool for scanning and analyzing Google Takeout archives without extraction.
 
+> **Where this fits.** [`Google_Takeout_Downloader`](https://github.com/conradstorz/Google_Takeout_Downloader)
+> fetches the archives. **Takeout Scout** explores them interactively in a
+> browser. [`Takeout_Inventory`](https://github.com/conradstorz/Takeout_Inventory)
+> produces a machine-readable pairing index and a static HTML report. Scout and
+> Inventory scan independently today — they share no code.
+
 ## Features
 
 - **🌐 Web Interface** - Clean, modern UI that runs in your browser
@@ -16,9 +22,10 @@ A modern, web-based tool for scanning and analyzing Google Takeout archives with
 
 ## Requirements
 
-- Python 3.8+
-- Streamlit (included in dependencies)
+- Python 3.10+
+- Streamlit and pandas (required dependencies, installed automatically)
 - Optional: `loguru` for enhanced logging (falls back to standard logging)
+- Optional: `Pillow` for reading photo EXIF metadata
 
 ## Installation
 
@@ -32,11 +39,17 @@ cd Takeout-Scout
 
 2. Install with uv:
 ```bash
-# Install with enhanced logging
+# Base install (streamlit + pandas)
+uv pip install -e .
+
+# With enhanced logging
 uv pip install -e ".[logging]"
 
-# Or install minimal version (standard library only)
-uv pip install -e .
+# With EXIF metadata support
+uv pip install -e ".[exif]"
+
+# With everything
+uv pip install -e ".[full]"
 ```
 
 ### Using pip
@@ -49,11 +62,17 @@ cd Takeout-Scout
 
 2. Install dependencies:
 ```bash
+# Base install (streamlit + pandas)
+pip install -e .
+
 # With enhanced logging
 pip install -e ".[logging]"
 
-# Or minimal install
-pip install -e .
+# With EXIF metadata support
+pip install -e ".[exif]"
+
+# With everything
+pip install -e ".[full]"
 ```
 
 ## Usage
@@ -66,6 +85,11 @@ streamlit run app.py
 Or use uv:
 ```bash
 uv run streamlit run app.py
+```
+
+Or use the convenience launcher (after installation):
+```bash
+uv run takeout-scout
 ```
 
 The app will automatically open in your default web browser at `http://localhost:8501`.
@@ -91,28 +115,36 @@ The app will automatically open in your default web browser at `http://localhost
 - **CSV Export** - Download results with timestamp
 - **Clear Results** - Start fresh with one click
 
-## Legacy Tkinter Version
-
-The original tkinter desktop version is still available as `ts.py`:
-```bash
-python ts.py
-# or
-uv run python ts.py
-```
-
 ## Project Structure
 
 ```
-Takeout_Scout/
-├── app.py                     # Streamlit web application (recommended)
-├── ts.py                      # Legacy tkinter desktop app
+Takeout-Scout/
+├── app.py                     # Streamlit web application
+├── run_app.py                 # Launcher: starts Streamlit on app.py
+├── takeout_scout/             # Scanning engine (importable package)
+│   ├── scanner.py             # Archive and directory scanning
+│   ├── sidecar.py             # Google Takeout JSON sidecar parsing
+│   ├── hashing.py             # File hashing utilities
+│   ├── metadata.py            # EXIF metadata extraction
+│   ├── discovery.py           # Discovery tracking system
+│   ├── models.py              # Data models
+│   ├── constants.py           # Constants and configuration
+│   ├── logging.py             # Logging configuration
+│   └── utils.py               # Utility functions
+├── tests/                     # pytest suite for takeout_scout/
+├── docs/superpowers/          # Design specs and implementation plans
 ├── logs/                      # Log files (auto-created)
 │   └── takeout_scout.log
 ├── state/                     # Persistent state (auto-created)
 │   └── takeout_index.json
+├── discoveries_index.json    # Main index of all discoveries (auto-created)
+├── takeouts_discovered/       # Per-source discovery records (auto-created)
 ├── README.md                  # This file
+├── DISCOVERY_TRACKING.md      # How discovery records work
+├── METADATA_FEATURES.md       # EXIF extraction details
 ├── LICENSE                    # GNU GPL v3 License
 ├── pyproject.toml             # Project configuration
+├── requirements.txt           # Dependency list for pip users
 └── .gitignore                 # Git ignore rules
 ```
 
@@ -134,7 +166,7 @@ Planned features for future releases:
 
 ## Logging
 
-All operations are logged to `logs/takeout_scout.log` with automatic rotation at 5MB. Access logs via the "Open Logs..." button in the GUI.
+All operations are logged to `logs/takeout_scout.log` with automatic rotation at 5MB.
 
 ## License
 

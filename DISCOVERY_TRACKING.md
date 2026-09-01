@@ -6,9 +6,8 @@ The Takeout Scout now includes a comprehensive discovery tracking system that pe
 ## Directory Structure
 
 ```
-takeout_scout/
+Takeout-Scout/
 ├── app.py
-├── ts.py
 ├── discoveries_index.json          # Main index of all discoveries
 ├── takeouts_discovered/            # Directory containing individual takeout records
 │   ├── MyTakeout_a1b2c3d4e5f6.takeout_scout
@@ -23,7 +22,7 @@ takeout_scout/
 ## Files Created
 
 ### 1. `discoveries_index.json` (Main Index)
-Located in the same directory where app.py/ts.py is run from.
+Located in the same directory the app is run from.
 Maps source paths to their discovery JSON filenames:
 
 ```json
@@ -257,6 +256,5 @@ Potential features for future versions:
 - The `takeouts_discovered/` directory will grow with each unique takeout scanned
 
 ### Compatibility
-- Works with both GUI (ts.py) and Web (app.py) versions
 - All discovery files are portable (can be copied to other systems)
 - JSON format ensures long-term readability

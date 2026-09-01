@@ -47,15 +47,12 @@ Metadata can be extracted from photos in:
 
 ### 4. Updated Display Columns
 
-#### GUI (ts.py)
+#### Web UI (app.py)
 New columns in the table view:
 - **w/EXIF**: Count of photos with EXIF data
 - **w/GPS**: Count of photos with GPS coordinates
 - **w/Date**: Count of photos with original date/time
 - **Checked**: Total photos analyzed for metadata
-
-#### Web UI (app.py)
-Same columns added to the Streamlit interface
 
 #### CSV Export
 CSV files now include these additional columns:

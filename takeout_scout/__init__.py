@@ -41,6 +41,7 @@ from takeout_scout.hashing import (
     hash_zip_member,
     hash_tar_member,
     HashIndex,
+    summarize_sources,
 )
 from takeout_scout.sidecar import (
     SidecarMetadata,
@@ -88,6 +89,7 @@ __all__ = [
     "hash_zip_member",
     "hash_tar_member",
     "HashIndex",
+    "summarize_sources",
     # Sidecar parsing
     "SidecarMetadata",
     "GeoLocation",
