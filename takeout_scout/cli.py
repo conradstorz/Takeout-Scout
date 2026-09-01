@@ -6,6 +6,8 @@ Starts the Streamlit web interface (app.py). Lives inside the takeout_scout/
 package so it ships in the wheel and the takeout-scout console script can
 find it after a non-editable install.
 """
+from __future__ import annotations
+
 import sys
 import subprocess
 from pathlib import Path
