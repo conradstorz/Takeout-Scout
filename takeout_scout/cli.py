@@ -19,13 +19,17 @@ def main():
     cmd = [sys.executable, "-m", "streamlit", "run", str(script_path)] + sys.argv[1:]
     
     try:
-        subprocess.run(cmd, check=True)
+        completed = subprocess.run(cmd)
     except KeyboardInterrupt:
         print("\n\nShutting down Takeout Scout...")
         sys.exit(0)
-    except subprocess.CalledProcessError as e:
-        print(f"Error launching Streamlit: {e}")
-        sys.exit(1)
+
+    # Exit with Streamlit's own code rather than collapsing every failure to 1.
+    # A supervisor or CI step reading this needs to tell "port already in use"
+    # from "killed" from "bad argument", and check=True threw all of that away.
+    if completed.returncode != 0:
+        print(f"Streamlit exited with code {completed.returncode}")
+    sys.exit(completed.returncode)
 
 
 if __name__ == "__main__":
