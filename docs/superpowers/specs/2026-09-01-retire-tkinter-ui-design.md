@@ -118,9 +118,11 @@ execute, and nothing in the repository noticed. Add `tests/test_docs.py`:
 > Every path that looks like a file in this repository, appearing inside a
 > fenced shell block in a tracked Markdown file, must exist on disk.
 
-Scope it deliberately: it matches tokens ending in `.py`, `.toml`, `.md` or
-`.json` and skips anything containing a URL scheme, a shell variable, or a
-wildcard. It is a spell-checker for commands, not a shell parser, and it must
+Scope it deliberately. "Fenced shell block" means a fence opened as ```bash
+or ```sh only — a bare ``` fence is excluded, which is what keeps the
+ASCII-art *Project Structure* tree out of the test's reach. Within those
+blocks it matches tokens ending in `.py`, `.toml`, `.md` or `.json`, and skips
+anything containing a URL scheme, a shell variable, or a wildcard. It is a spell-checker for commands, not a shell parser, and it must
 not become one.
 
 This is the repository's only test that covers documentation, which is where
