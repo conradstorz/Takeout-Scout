@@ -85,6 +85,19 @@ def test_known_object_attribute_accesses_are_real() -> None:
     they were 2-tuples) — that is a call-shape mistake, not an attribute
     name, and nothing static can catch it. That is what
     tests/test_hashing.py's summarize_sources tests are for.
+
+    It also CANNOT catch "the right attribute name, on the wrong kind of
+    object". This test maps the local name `fd` to the FileDetails class
+    and checks that every `fd.attr` access names something that exists ON
+    THAT CLASS — a static fact about the class, not a runtime fact about
+    what `fd` actually is. `discovery.file_details` is stored as plain
+    dicts (see models.py), so code that iterates it directly and does
+    `fd.file_type` raises AttributeError at runtime even though this test
+    passes: the attribute name is real, it's just not on the dict that's
+    actually flowing through the loop. That is exactly how a previous fix
+    here shipped broken while this guard passed. The runtime check that
+    closes that gap is test_iter_file_details_yields_objects_not_dicts,
+    below — no static check, this one included, can substitute for it.
     """
     valid_attrs = {name: _valid_attrs_for(cls) for name, cls in KNOWN_OBJECTS.items()}
 
@@ -118,3 +131,50 @@ def test_guard_actually_inspects_something() -> None:
     assert names_seen == set(KNOWN_OBJECTS), (
         f"expected accesses on all of {set(KNOWN_OBJECTS)}, only saw {names_seen}"
     )
+
+
+def test_iter_file_details_yields_objects_not_dicts() -> None:
+    """The static guard checks attribute names against a class; it cannot
+    check that the list actually holds instances of it. This does."""
+    raw_file_detail = {
+        "path": "Google Photos/2020/IMG_0001.jpg",
+        "size": 12345,
+        "file_type": "photo",
+        "extension": ".jpg",
+        "metadata": None,
+        "file_hash": None,
+        "sidecar_path": None,
+        "photo_taken_time": "2020-01-01T00:00:00",
+        "creation_time": "2020-01-01T00:00:00",
+    }
+
+    discovery = TakeoutDiscovery(
+        source_path="/fake/source.zip",
+        source_type="zip",
+        first_discovered="2020-01-01T00:00:00",
+        last_scanned="2020-01-01T00:00:00",
+        parts_group="fake",
+        service_guess="Google Photos",
+        file_count=1,
+        photos=1,
+        videos=0,
+        json_sidecars=0,
+        other=0,
+        compressed_size=12345,
+        file_details=[raw_file_detail],
+    )
+
+    # Round-trip through JSON serialization, exactly as state persistence does.
+    roundtripped = TakeoutDiscovery.from_dict(discovery.to_dict())
+
+    # The raw field is still plain dicts — that's the whole point of storing
+    # it that way, so the record round-trips through JSON unchanged.
+    assert isinstance(roundtripped.file_details[0], dict)
+
+    hydrated = list(roundtripped.iter_file_details())
+    assert len(hydrated) == 1
+    assert isinstance(hydrated[0], FileDetails), (
+        f"iter_file_details() must yield FileDetails instances, got "
+        f"{type(hydrated[0])!r}"
+    )
+    assert hydrated[0].file_type == "photo"

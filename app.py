@@ -979,8 +979,16 @@ def analyze_file_structure(members: List[str], base_path: str, progress_callback
         if progress_callback and idx % 500 == 0:
             progress_callback(f"Analyzing file {idx}/{len(members)}...", 0.3 + (idx / len(members)) * 0.5)
 
+        # Normalize separators up front: zip members always use '/', but a
+        # directory scan on Windows hands back backslashes, and folder.split('/')
+        # plus year_pattern below both assume '/'. Path(member).parent is not
+        # enough by itself on Windows: WindowsPath.__str__ re-emits '\\'
+        # regardless of the separator it was built from, so the derived
+        # `folder` needs the same normalization as `member`.
+        member = member.replace("\\", "/")
+
         member_lower = member.lower()
-        folder = str(Path(member).parent)
+        folder = str(Path(member).parent).replace("\\", "/")
         folder_structure[folder] += 1
 
         folder_parts = folder.split('/')
@@ -1211,7 +1219,7 @@ def show_date_analysis():
                 continue
             
             # Process the flat file list
-            for fd in discovery.file_details:
+            for fd in discovery.iter_file_details():
                 if fd.file_type in ('photo', 'video'):
                     total_media += 1
 
@@ -1487,7 +1495,7 @@ def show_timeline_analysis():
             if not discovery:
                 continue
             
-            for fd in discovery.file_details:
+            for fd in discovery.iter_file_details():
                 if fd.file_type in ('photo', 'video') and fd.photo_taken_time:
                     try:
                         dt = datetime.fromisoformat(fd.photo_taken_time)
@@ -1543,11 +1551,11 @@ def show_orphan_analysis():
                 continue
             
             # Build sets for lookup
-            json_files = {fd.path for fd in discovery.file_details if fd.file_type == 'json'}
-            media_files = {fd.path for fd in discovery.file_details if fd.file_type in ('photo', 'video')}
+            json_files = {fd.path for fd in discovery.iter_file_details() if fd.file_type == 'json'}
+            media_files = {fd.path for fd in discovery.iter_file_details() if fd.file_type in ('photo', 'video')}
 
             # Check each media file for sidecar
-            for fd in discovery.file_details:
+            for fd in discovery.iter_file_details():
                 if fd.file_type in ('photo', 'video'):
                     expected_sidecar = f"{fd.path}.json"
                     if expected_sidecar in json_files or fd.sidecar_path:
@@ -1560,7 +1568,7 @@ def show_orphan_analysis():
                         })
 
             # Check each JSON for matching media
-            for fd in discovery.file_details:
+            for fd in discovery.iter_file_details():
                 if fd.file_type == 'json' and fd.path.endswith('.json'):
                     # Expected media path: remove .json suffix
                     if fd.path.endswith('.json'):
@@ -1665,7 +1673,7 @@ def show_full_inventory():
             if not discovery:
                 continue
             
-            for fd in discovery.file_details:
+            for fd in discovery.iter_file_details():
                 inventory.append({
                     'source': Path(discovery.source_path).name,
                     'file_path': fd.path,
@@ -1751,8 +1759,7 @@ def process_uploaded_files(uploaded_files):
             
             # Now scan them
             load_files(file_paths)
-            st.success(f"✅ Uploaded and loaded {len(file_paths)} file(s)")
-            
+
     except Exception as e:
         logger.exception(f"Error processing uploads: {e}")
         st.error(f"❌ Error processing uploads: {e}")
