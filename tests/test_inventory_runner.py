@@ -80,3 +80,82 @@ class TestFindInventory:
         monkeypatch.setattr("takeout_scout.inventory_runner.SCOUT_ROOT", scout_root)
 
         assert find_inventory().script.is_absolute()
+
+
+import sys
+
+from takeout_scout.inventory_runner import (
+    InventoryFailed,
+    deep_pass_commands,
+    run_streaming,
+)
+
+
+class TestDeepPassCommands:
+    """These argv strings are a contract with another repository's CLI.
+
+    If Inventory renames a flag, this is what notices. Asserted literally on
+    purpose - a test that rebuilt the expected value from the same code under
+    test would notice nothing.
+    """
+
+    def test_two_phases_in_order(self, tmp_path):
+        tool = InventoryTool(tmp_path / "takeout_inventory.py", "sibling")
+        phases = [name for name, _ in deep_pass_commands(tool, tmp_path / "export")]
+        assert phases == ["scan", "index"]
+
+    def test_scan_command(self, tmp_path):
+        script = tmp_path / "takeout_inventory.py"
+        export = tmp_path / "export"
+        tool = InventoryTool(script, "sibling")
+
+        name, argv = deep_pass_commands(tool, export)[0]
+
+        assert name == "scan"
+        assert argv == ["uv", "run", str(script), "scan", "--takeout", str(export)]
+
+    def test_index_command_writes_beside_the_export(self, tmp_path):
+        script = tmp_path / "takeout_inventory.py"
+        export = tmp_path / "export"
+        tool = InventoryTool(script, "sibling")
+
+        name, argv = deep_pass_commands(tool, export)[1]
+
+        assert name == "index"
+        assert argv == [
+            "uv", "run", str(script), "index",
+            "--out-sqlite", str(export / "takeout-index.sqlite"),
+            "--out-json", str(export / "takeout-index.json"),
+        ]
+
+
+class TestRunStreaming:
+    def test_yields_output_lines_as_they_arrive(self, tmp_path):
+        cmd = [sys.executable, "-c", "print('one'); print('two')"]
+        assert list(run_streaming(cmd, tmp_path)) == ["one", "two"]
+
+    def test_raises_with_the_exit_code_on_failure(self, tmp_path):
+        cmd = [sys.executable, "-c", "print('context'); raise SystemExit(4)"]
+
+        with pytest.raises(InventoryFailed) as exc:
+            list(run_streaming(cmd, tmp_path))
+
+        assert exc.value.returncode == 4
+        assert "context" in exc.value.tail
+
+    def test_tail_is_bounded(self, tmp_path):
+        """A failing run must not paste ten thousand lines into the page."""
+        cmd = [sys.executable, "-c",
+               "[print(i) for i in range(500)]; raise SystemExit(1)"]
+
+        with pytest.raises(InventoryFailed) as exc:
+            list(run_streaming(cmd, tmp_path))
+
+        assert len(exc.value.tail) <= 20
+
+    def test_undecodable_output_does_not_crash(self, tmp_path):
+        """Takeout filenames contain every script on earth."""
+        cmd = [sys.executable, "-c",
+               "import sys; sys.stdout.buffer.write(b'caf\\xe9\\n')"]
+        lines = list(run_streaming(cmd, tmp_path))
+        assert len(lines) == 1

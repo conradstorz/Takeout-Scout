@@ -14,8 +14,10 @@ to be run with `uv run`.
 """
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 # Scout's repository root: takeout_scout/inventory_runner.py -> repo root.
 # A module-level constant so tests can point it somewhere harmless.
@@ -55,3 +57,87 @@ def find_inventory(remembered: str | None = None) -> InventoryTool | None:
         return InventoryTool(sibling.resolve(), "sibling")
 
     return None
+
+
+INDEX_SQLITE_NAME = "takeout-index.sqlite"
+INDEX_JSON_NAME = "takeout-index.json"
+
+# How many trailing output lines to keep for a failure report. Enough to show
+# a traceback, few enough not to flood the page.
+FAILURE_TAIL_LINES = 20
+
+
+class InventoryFailed(Exception):
+    """A deep-pass phase exited non-zero.
+
+    Carries the phase name so the report can say which half failed - a scan
+    that dies is a different problem from an index that dies.
+    """
+
+    def __init__(self, phase: str, returncode: int, tail: list[str]) -> None:
+        super().__init__(f"{phase} exited with code {returncode}")
+        self.phase = phase
+        self.returncode = returncode
+        self.tail = tail
+
+
+def deep_pass_commands(
+    tool: InventoryTool, takeout_dir: Path
+) -> list[tuple[str, list[str]]]:
+    """The commands to run, in order, as (phase name, argv) pairs.
+
+    Two separate commands rather than one, so a failure names the phase.
+
+    Run through `uv run` because Inventory declares its dependencies in a
+    PEP 723 header; uv resolves them without Scout knowing what they are,
+    which is exactly the arm's-length relationship the licence needs.
+    """
+    script = str(tool.script)
+    export = Path(takeout_dir)
+    return [
+        ("scan", ["uv", "run", script, "scan", "--takeout", str(export)]),
+        (
+            "index",
+            [
+                "uv", "run", script, "index",
+                "--out-sqlite", str(export / INDEX_SQLITE_NAME),
+                "--out-json", str(export / INDEX_JSON_NAME),
+            ],
+        ),
+    ]
+
+
+def run_streaming(
+    cmd: list[str], cwd: Path, phase: str = "inventory"
+) -> Iterator[str]:
+    """Yield the subprocess's output lines as they arrive.
+
+    rich detects that stdout is not a terminal and emits plain text without
+    escape codes or live-updating bars, so the lines arrive ready to display.
+
+    errors="replace" because Inventory prints file names, and a Takeout export
+    contains filenames in every script on earth. A mangled character in a
+    progress line must never abort a twenty-minute scan.
+    """
+    tail: list[str] = []
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+
+    assert process.stdout is not None
+    for raw in process.stdout:
+        line = raw.rstrip("\n")
+        tail.append(line)
+        del tail[:-FAILURE_TAIL_LINES]
+        yield line
+
+    returncode = process.wait()
+    if returncode != 0:
+        raise InventoryFailed(phase, returncode, tail)
