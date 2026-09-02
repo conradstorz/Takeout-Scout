@@ -56,6 +56,27 @@ from takeout_scout.sidecar import (
     find_sidecar_for_media,
 )
 from takeout_scout.utils import human_size
+from takeout_scout.inventory_runner import (
+    InventoryTool,
+    InventoryFailed,
+    find_inventory,
+    deep_pass_commands,
+    run_streaming,
+    export_dir_for,
+    INDEX_SQLITE_NAME,
+)
+from takeout_scout.index_reader import (
+    IndexUnusable,
+    IndexedPairing,
+    TakeoutIndex,
+)
+from takeout_scout.worklist import (
+    Finding,
+    build_worklist,
+    compare_with_scout,
+    COMPARABLE_TYPES,
+    is_comparable,
+)
 
 __all__ = [
     # Version info
@@ -103,4 +124,20 @@ __all__ = [
     "find_sidecar_for_media",
     # Utils
     "human_size",
+    # Inventory integration
+    "InventoryTool",
+    "InventoryFailed",
+    "find_inventory",
+    "deep_pass_commands",
+    "run_streaming",
+    "export_dir_for",
+    "INDEX_SQLITE_NAME",
+    "IndexUnusable",
+    "IndexedPairing",
+    "TakeoutIndex",
+    "Finding",
+    "build_worklist",
+    "compare_with_scout",
+    "COMPARABLE_TYPES",
+    "is_comparable",
 ]
