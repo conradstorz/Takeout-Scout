@@ -4,11 +4,20 @@ Scout runs Takeout_Inventory as a separate program, never as an import -
 Scout is GPL-3 and Inventory is AGPL-3, and importing would make a combined
 work. These tests cover locating it and building its command line.
 """
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from takeout_scout.inventory_runner import InventoryTool, find_inventory, export_dir_for
+from takeout_scout.inventory_runner import (
+    InventoryFailed,
+    InventoryTool,
+    deep_pass_commands,
+    export_dir_for,
+    find_inventory,
+    run_streaming,
+)
 
 
 def _make_inventory(root: Path) -> Path:
@@ -113,16 +122,6 @@ class TestFindInventory:
         assert found is not None
         assert found.script == script
         assert found.source == "sibling"
-
-
-import sys
-import time
-
-from takeout_scout.inventory_runner import (
-    InventoryFailed,
-    deep_pass_commands,
-    run_streaming,
-)
 
 
 class TestDeepPassCommands:

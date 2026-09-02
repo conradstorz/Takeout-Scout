@@ -150,6 +150,9 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 RECENT_FOLDERS_PATH = STATE_DIR / 'recent_folders.json'
 MAX_RECENT_FOLDERS = 10
 INVENTORY_PATH_FILE = STATE_DIR / 'inventory_path.json'
+# Only the last DISPLAYED_LINES are ever rendered; keeping the rest just
+# retains every progress line of a long scan for nothing.
+DISPLAYED_LINES = 40
 
 
 def load_inventory_path() -> Optional[str]:
@@ -1842,6 +1845,12 @@ def show_deep_pass_offer():
             )
             if entered and st.button("Save path"):
                 cleaned = clean_file_path(entered)
+                # Store an absolute path: a relative one would resolve
+                # against whatever directory Streamlit was started in.
+                try:
+                    cleaned = str(Path(cleaned).expanduser().resolve())
+                except (OSError, RuntimeError, ValueError):
+                    pass  # keep the raw string; find_inventory guards it
                 st.session_state.inventory_path = cleaned
                 save_inventory_path(cleaned)
                 st.rerun()
@@ -1883,7 +1892,8 @@ def run_deep_pass(tool: InventoryTool, takeout_dir: Path):
         try:
             for line in run_streaming(cmd, takeout_dir, phase=phase):
                 lines.append(line)
-                output.code("\n".join(lines[-40:]))
+                del lines[:-DISPLAYED_LINES]
+                output.code("\n".join(lines))
         except FileNotFoundError:
             st.error(
                 "Could not run `uv`. Takeout Inventory is a PEP 723 script "
@@ -1905,7 +1915,7 @@ def run_deep_pass(tool: InventoryTool, takeout_dir: Path):
         st.error(f"The deep pass finished but its index could not be read: {e}")
         return
 
-    scout_pairings = _scout_pairings()
+    scout_pairings = _scout_pairings(takeout_dir)
     agree, disagree, disagreements = compare_with_scout(index, scout_pairings)
 
     st.session_state.worklist = build_worklist(index) + disagreements
@@ -1921,14 +1931,22 @@ def run_deep_pass(tool: InventoryTool, takeout_dir: Path):
     st.rerun()
 
 
-def _scout_pairings() -> dict:
-    """Scout's own media→sidecar answers, for comparison with Inventory's.
+def _scout_pairings(takeout_dir: Path) -> dict:
+    """Scout's own media→sidecar answers for one export, for comparison.
+
+    Scoped to `takeout_dir` because pairings are keyed by path *inside* an
+    archive: two exports scanned in the same session can hold the same member
+    path, and an unscoped dictionary would let one export's answers overwrite
+    another's and skew the comparison.
 
     Read from the discovery records the quick scan already wrote, so this
     compares what Scout actually concluded rather than recomputing it.
     """
+    wanted = str(takeout_dir)
     pairings = {}
     for result in st.session_state.results:
+        if export_dir_for(result.path) != wanted:
+            continue
         try:
             discovery = load_takeout_discovery(Path(result.path))
             if not discovery:

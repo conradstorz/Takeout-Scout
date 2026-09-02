@@ -12,7 +12,6 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote
 
 # The schema this reader understands. Inventory's INDEX_SCHEMA_VERSION.
 # A higher value means Inventory moved on and Scout has not; refuse rather
@@ -62,8 +61,10 @@ class TakeoutIndex:
         if not path.is_file():
             raise IndexUnusable(f"no index at {path}")
 
-        # quote() so a path with spaces or '#' survives the URI round-trip.
-        uri = f"file:{quote(str(path.resolve()))}?mode=ro"
+        # as_uri() rather than quoting the raw string: it is the documented way
+        # to build a file URI and needs no thought about drive letters or
+        # separators. mode=ro so Scout cannot write to another program's output.
+        uri = f"{path.resolve().as_uri()}?mode=ro"
         try:
             con = sqlite3.connect(uri, uri=True)
             con.row_factory = sqlite3.Row
