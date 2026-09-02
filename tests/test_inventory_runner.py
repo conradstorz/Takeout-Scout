@@ -83,6 +83,7 @@ class TestFindInventory:
 
 
 import sys
+import time
 
 from takeout_scout.inventory_runner import (
     InventoryFailed,
@@ -159,3 +160,32 @@ class TestRunStreaming:
                "import sys; sys.stdout.buffer.write(b'caf\\xe9\\n')"]
         lines = list(run_streaming(cmd, tmp_path))
         assert len(lines) == 1
+
+    def test_abandoning_the_generator_kills_the_child(self, tmp_path):
+        """A Streamlit rerun mid-scan must not leave uv running detached."""
+        marker = tmp_path / "still_alive.txt"
+        child = (
+            "import sys, time, pathlib\n"
+            "print('started', flush=True)\n"
+            "time.sleep(5)\n"
+            f"pathlib.Path(r'{marker}').write_text('x')\n"
+        )
+        stream = run_streaming([sys.executable, "-c", child], tmp_path)
+
+        assert next(stream) == "started"
+        stream.close()          # what GeneratorExit does on abandonment
+
+        # Wait past the child's full 5s sleep. A shorter wait can't tell a
+        # killed child from a merely-not-finished-yet one: the marker
+        # wouldn't exist within 1.5s either way, so that duration proves
+        # nothing. Only outlasting the sleep makes the assertion meaningful.
+        time.sleep(6)
+        assert not marker.exists(), "child survived abandonment of the generator"
+
+    def test_failure_carries_the_phase_it_was_given(self, tmp_path):
+        cmd = [sys.executable, "-c", "raise SystemExit(2)"]
+
+        with pytest.raises(InventoryFailed) as exc:
+            list(run_streaming(cmd, tmp_path, phase="index"))
+
+        assert exc.value.phase == "index"

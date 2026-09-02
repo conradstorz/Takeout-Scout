@@ -14,6 +14,7 @@ to be run with `uv run`.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,6 +121,10 @@ def run_streaming(
     progress line must never abort a twenty-minute scan.
     """
     tail: list[str] = []
+    # PYTHONUNBUFFERED because bufsize=1 only line-buffers *our* reads; a
+    # Python child writing to a pipe block-buffers unless told otherwise, and
+    # bursty output defeats the point of streaming at all.
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     process = subprocess.Popen(
         cmd,
         cwd=str(cwd),
@@ -129,15 +134,30 @@ def run_streaming(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env=env,
     )
 
-    assert process.stdout is not None
-    for raw in process.stdout:
-        line = raw.rstrip("\n")
-        tail.append(line)
-        del tail[:-FAILURE_TAIL_LINES]
-        yield line
+    try:
+        assert process.stdout is not None
+        for raw in process.stdout:
+            line = raw.rstrip("\n")
+            tail.append(line)
+            del tail[:-FAILURE_TAIL_LINES]
+            yield line
 
-    returncode = process.wait()
-    if returncode != 0:
-        raise InventoryFailed(phase, returncode, tail)
+        returncode = process.wait()
+        if returncode != 0:
+            raise InventoryFailed(phase, returncode, tail)
+    finally:
+        # Runs on normal completion, on InventoryFailed, and on GeneratorExit
+        # when a consumer abandons the iteration. Without it an interrupted
+        # Streamlit rerun leaves a multi-minute archive scan running detached.
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
