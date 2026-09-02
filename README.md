@@ -2,11 +2,13 @@
 
 A modern, web-based tool for scanning and analyzing Google Takeout archives without extraction.
 
-> **Where this fits.** [`Google_Takeout_Downloader`](https://github.com/conradstorz/Google_Takeout_Downloader)
+> **Where this fits.** [`Google-Takeout-Downloader`](https://github.com/conradstorz/Google-Takeout-Downloader)
 > fetches the archives. **Takeout Scout** explores them interactively in a
-> browser. [`Takeout_Inventory`](https://github.com/conradstorz/Takeout_Inventory)
-> produces a machine-readable pairing index and a static HTML report. Scout and
-> Inventory scan independently today — they share no code.
+> browser — it is the human-facing half.
+> [`Takeout_Inventory`](https://github.com/conradstorz/Takeout_Inventory) is the
+> machine-facing half: it produces a pairing index another program can read.
+> Scout runs it for you when you want the complete answer, as a separate
+> program — the two share no code, deliberately. See [ROADMAP.md](ROADMAP.md).
 
 ## Features
 
@@ -161,6 +163,7 @@ Takeout-Scout/
 ├── discoveries_index.json    # Main index of all discoveries (auto-created)
 ├── takeouts_discovered/       # Per-source discovery records (auto-created)
 ├── README.md                  # This file
+├── ROADMAP.md                 # Where this fits, and where it is going
 ├── DISCOVERY_TRACKING.md      # How discovery records work
 ├── METADATA_FEATURES.md       # EXIF extraction details
 ├── LICENSE                    # GNU GPL v3 License
@@ -176,14 +179,10 @@ Takeout-Scout/
 - **Incremental** - Future features (unpack, merge, dedupe) can be added without changing scan logic
 - **User-friendly** - Clear GUI with progress indicators and helpful messages
 
-## Future Enhancements
+## Where this is going
 
-Planned features for future releases:
-- Archive extraction with smart output organization
-- JSON sidecar → EXIF metadata merging
-- Duplicate detection and reporting
-- File organization by date/service
-- Batch processing automation
+See [ROADMAP.md](ROADMAP.md) — what is built, what is next, and what has been
+settled and will not change.
 
 ## Logging
 
@@ -195,4 +194,4 @@ GNU General Public License v3 (GPLv3) - See LICENSE file for details
 
 ## Author
 
-Created by ChatGPT for Conrad
+Conrad Storz.
