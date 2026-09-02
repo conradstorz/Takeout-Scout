@@ -60,6 +60,19 @@ def find_inventory(remembered: str | None = None) -> InventoryTool | None:
     return None
 
 
+def export_dir_for(scanned_path: str) -> str:
+    """The directory Inventory should be pointed at for a scanned result.
+
+    ArchiveSummary.path is whatever was scanned. For an archive
+    (D:/exports/takeout-001.zip) the export directory is its parent. For a
+    directory scan (D:/exports/Takeout) the path *is* the export directory -
+    taking .parent there would send Inventory one level too high, where it
+    would find the wrong thing or nothing.
+    """
+    path = Path(scanned_path)
+    return str(path if path.is_dir() else path.parent)
+
+
 INDEX_SQLITE_NAME = "takeout-index.sqlite"
 INDEX_JSON_NAME = "takeout-index.json"
 

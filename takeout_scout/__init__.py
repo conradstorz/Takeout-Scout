@@ -62,6 +62,7 @@ from takeout_scout.inventory_runner import (
     find_inventory,
     deep_pass_commands,
     run_streaming,
+    export_dir_for,
 )
 from takeout_scout.index_reader import (
     IndexUnusable,
@@ -72,6 +73,8 @@ from takeout_scout.worklist import (
     Finding,
     build_worklist,
     compare_with_scout,
+    COMPARABLE_TYPES,
+    is_comparable,
 )
 
 __all__ = [
@@ -126,10 +129,13 @@ __all__ = [
     "find_inventory",
     "deep_pass_commands",
     "run_streaming",
+    "export_dir_for",
     "IndexUnusable",
     "IndexedPairing",
     "TakeoutIndex",
     "Finding",
     "build_worklist",
     "compare_with_scout",
+    "COMPARABLE_TYPES",
+    "is_comparable",
 ]

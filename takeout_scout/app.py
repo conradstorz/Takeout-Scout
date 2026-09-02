@@ -48,6 +48,8 @@ from takeout_scout import (
     TakeoutIndex,
     build_worklist,
     compare_with_scout,
+    export_dir_for,
+    is_comparable,
 )
 from takeout_scout.utils import partition_known_paths, remove_dirs, unreferenced_dirs
 from takeout_scout.constants import ensure_directories
@@ -1834,7 +1836,7 @@ def show_deep_pass_offer():
                 st.rerun()
         return
 
-    directories = sorted({_export_dir_for(r.path) for r in st.session_state.results})
+    directories = sorted({export_dir_for(r.path) for r in st.session_state.results})
 
     st.caption(f"Using `{tool.script}` (found: {tool.source})")
     if len(directories) == 1:
@@ -1857,19 +1859,6 @@ def show_deep_pass_offer():
         run_deep_pass(tool, Path(chosen))
 
 
-def _export_dir_for(scanned_path: str) -> str:
-    """The directory Inventory should be pointed at for a scanned result.
-
-    ArchiveSummary.path is whatever was scanned. For an archive
-    (D:/exports/takeout-001.zip) the export directory is its parent. For a
-    directory scan (D:/exports/Takeout) the path *is* the export directory —
-    taking .parent there would send Inventory one level too high, where it
-    would find the wrong thing or nothing.
-    """
-    path = Path(scanned_path)
-    return str(path if path.is_dir() else path.parent)
-
-
 def run_deep_pass(tool: InventoryTool, takeout_dir: Path):
     """Run Inventory's two phases, streaming output into the page."""
     output = st.empty()
@@ -1886,6 +1875,9 @@ def run_deep_pass(tool: InventoryTool, takeout_dir: Path):
                 "Could not run `uv`. Takeout Inventory is a PEP 723 script "
                 "and needs uv on PATH to resolve its dependencies."
             )
+            return
+        except OSError as e:
+            st.error(f"Could not start the {phase} phase: {e}")
             return
         except InventoryFailed as failure:
             st.error(f"The {failure.phase} phase exited with code {failure.returncode}.")
@@ -1908,7 +1900,8 @@ def run_deep_pass(tool: InventoryTool, takeout_dir: Path):
         'confidence': index.counts_by_confidence(),
         'agreements': agree,
         'disagreements': disagree,
-        'compared': len(scout_pairings),
+        'compared': agree + disagree,
+        'scout_paired': len(scout_pairings),
     }
     st.success("Deep pass complete.")
     st.rerun()
@@ -1927,7 +1920,7 @@ def _scout_pairings() -> dict:
             if not discovery:
                 continue
             for fd in discovery.iter_file_details():
-                if fd.file_type in ('photo', 'video'):
+                if is_comparable(fd.file_type):
                     pairings[fd.path] = fd.sidecar_path
         except Exception:
             logger.exception(f"Could not read Scout pairings for {result.path}")
@@ -1949,9 +1942,18 @@ def show_worklist():
         col1.metric("Compared", f"{summary['compared']:,}")
         col2.metric("Agreed", f"{summary['agreements']:,}")
         col3.metric("Scout was wrong", f"{summary['disagreements']:,}")
+        if summary.get('scout_paired', 0) > summary['compared']:
+            st.caption(
+                f"Scout paired {summary['scout_paired']:,} files; "
+                f"{summary['compared']:,} of them appear in the index and "
+                f"could be compared."
+            )
         st.caption(
-            "Scout pairs within one archive; Inventory pairs across all of "
-            "them. Where they differ, Inventory is right."
+            "Scout pairs within a single archive; Inventory pairs across all "
+            "of them, so it sees sidecars Scout cannot. Where they differ, "
+            "Inventory usually has more evidence — but check the work list "
+            "below: pairings it marks ambiguous or related are ones it was "
+            "not certain about either."
         )
 
     findings = st.session_state.worklist or []

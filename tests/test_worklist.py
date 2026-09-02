@@ -7,7 +7,12 @@ about an inventory being complete.
 import pytest
 
 from takeout_scout.index_reader import IndexedPairing
-from takeout_scout.worklist import Finding, build_worklist, compare_with_scout
+from takeout_scout.worklist import (
+    Finding,
+    build_worklist,
+    compare_with_scout,
+    is_comparable,
+)
 
 
 class FakeIndex:
@@ -131,3 +136,17 @@ class TestCompareWithScout:
             IndexedPairing("a.jpg", "p.zip", None, "orphan", "none")])
         agree, disagree, _ = compare_with_scout(index, {"a.jpg": None})
         assert (agree, disagree) == (1, 0)
+
+
+class TestIsComparable:
+    def test_media_is_comparable(self):
+        assert is_comparable("photo")
+        assert is_comparable("video")
+
+    def test_json_and_other_are_not(self):
+        assert not is_comparable("json")
+        assert not is_comparable("other")
+
+    def test_none_is_not(self):
+        """file_type is Optional on FileDetails."""
+        assert not is_comparable(None)

@@ -19,6 +19,16 @@ UNPARSEABLE_SIDECAR = "unparseable_sidecar"
 DISAGREEMENT = "disagreement"
 
 
+# What Scout's pairings are compared against Inventory's. Only media has a
+# sidecar to be paired with; JSON and other members are not candidates.
+COMPARABLE_TYPES = frozenset({"photo", "video"})
+
+
+def is_comparable(file_type: str | None) -> bool:
+    """Whether a scanned file participates in media-to-sidecar pairing."""
+    return file_type in COMPARABLE_TYPES
+
+
 @dataclass(frozen=True)
 class Finding:
     """One thing that is wrong, and enough context to act on it."""

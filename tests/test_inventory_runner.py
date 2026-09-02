@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from takeout_scout.inventory_runner import InventoryTool, find_inventory
+from takeout_scout.inventory_runner import InventoryTool, find_inventory, export_dir_for
 
 
 def _make_inventory(root: Path) -> Path:
@@ -189,3 +189,20 @@ class TestRunStreaming:
             list(run_streaming(cmd, tmp_path, phase="index"))
 
         assert exc.value.phase == "index"
+
+
+class TestExportDirFor:
+    def test_archive_yields_its_parent(self, tmp_path):
+        archive = tmp_path / "takeout-001.zip"
+        archive.write_bytes(b"not really a zip")
+        assert export_dir_for(str(archive)) == str(tmp_path)
+
+    def test_directory_yields_itself(self, tmp_path):
+        """A directory scan's path IS the export dir; .parent would be wrong."""
+        export = tmp_path / "Takeout"
+        export.mkdir()
+        assert export_dir_for(str(export)) == str(export)
+
+    def test_missing_path_is_treated_as_a_file(self, tmp_path):
+        """A path that no longer exists is not a directory, so use its parent."""
+        assert export_dir_for(str(tmp_path / "gone.zip")) == str(tmp_path)
