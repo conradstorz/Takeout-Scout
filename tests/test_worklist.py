@@ -100,7 +100,7 @@ class TestCompareWithScout:
         index = FakeIndex(pairings=[
             IndexedPairing("a.jpg", "p.zip", "a.jpg.json", "exact", "own")])
         agree, disagree, findings = compare_with_scout(
-            index, {"a.jpg": "a.jpg.json"})
+            index, {("p.zip", "a.jpg"): "a.jpg.json"})
         assert (agree, disagree) == (1, 0)
         assert findings == []
 
@@ -110,7 +110,7 @@ class TestCompareWithScout:
             IndexedPairing("a.jpg", "p2.zip", "other/a.jpg.json",
                            "cross-directory", "own")])
         agree, disagree, findings = compare_with_scout(
-            index, {"a.jpg": "wrong/a.jpg.json"})
+            index, {("p2.zip", "a.jpg"): "wrong/a.jpg.json"})
         assert (agree, disagree) == (0, 1)
         assert findings[0].kind == "disagreement"
         assert "other/a.jpg.json" in findings[0].detail
@@ -120,7 +120,8 @@ class TestCompareWithScout:
         index = FakeIndex(pairings=[
             IndexedPairing("a.jpg", "p2.zip", "far/a.jpg.json",
                            "cross-directory", "own")])
-        agree, disagree, _ = compare_with_scout(index, {"a.jpg": None})
+        agree, disagree, _ = compare_with_scout(
+            index, {("p2.zip", "a.jpg"): None})
         assert (agree, disagree) == (0, 1)
 
     def test_media_scout_never_saw_is_not_a_disagreement(self):
@@ -134,8 +135,33 @@ class TestCompareWithScout:
     def test_both_none_is_agreement(self):
         index = FakeIndex(pairings=[
             IndexedPairing("a.jpg", "p.zip", None, "orphan", "none")])
-        agree, disagree, _ = compare_with_scout(index, {"a.jpg": None})
+        agree, disagree, _ = compare_with_scout(
+            index, {("p.zip", "a.jpg"): None})
         assert (agree, disagree) == (1, 0)
+
+    def test_same_path_in_two_archives_does_not_collide(self):
+        """A member path is not unique across an export.
+
+        Inventory's index is keyed on (archive, path) for this reason. Keying
+        on the path alone let one archive's answer overwrite another's, and
+        silently corrupted the counts.
+        """
+        index = FakeIndex(pairings=[
+            IndexedPairing("IMG_1.jpg", "part1.zip", "IMG_1.jpg.json",
+                           "exact", "own"),
+            IndexedPairing("IMG_1.jpg", "part2.zip", "other/IMG_1.jpg.json",
+                           "cross-directory", "own"),
+        ])
+        scout = {
+            ("part1.zip", "IMG_1.jpg"): "IMG_1.jpg.json",   # Scout got this one right
+            ("part2.zip", "IMG_1.jpg"): None,               # and missed this one
+        }
+
+        agree, disagree, findings = compare_with_scout(index, scout)
+
+        assert (agree, disagree) == (1, 1)
+        assert findings[0].kind == "disagreement"
+        assert "part2.zip" in findings[0].detail
 
 
 class TestIsComparable:

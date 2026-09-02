@@ -1941,10 +1941,16 @@ def run_deep_pass(tool: InventoryTool, takeout_dir: Path):
 def _scout_pairings(takeout_dir: Path) -> dict:
     """Scout's own media→sidecar answers for one export, for comparison.
 
-    Scoped to `takeout_dir` because pairings are keyed by path *inside* an
-    archive: two exports scanned in the same session can hold the same member
-    path, and an unscoped dictionary would let one export's answers overwrite
-    another's and skew the comparison.
+    Keyed by (archive, path), matching Inventory's index: a member path alone
+    is not unique across an export, since the same path can occur in more
+    than one archive. The archive identifier is the scanned archive's file
+    name (e.g. "takeout-001.zip"), which is what Inventory records as
+    media.archive when it indexes a zip member.
+
+    Scoped to `takeout_dir` because two exports scanned in the same session
+    can otherwise hold the same (archive, path) pair, and an unscoped
+    dictionary would let one export's answers overwrite another's and skew
+    the comparison.
 
     Read from the discovery records the quick scan already wrote, so this
     compares what Scout actually concluded rather than recomputing it.
@@ -1958,9 +1964,11 @@ def _scout_pairings(takeout_dir: Path) -> dict:
             discovery = load_takeout_discovery(Path(result.path))
             if not discovery:
                 continue
+            result_path = Path(result.path)
+            archive = None if result_path.is_dir() else result_path.name
             for fd in discovery.iter_file_details():
                 if is_comparable(fd.file_type):
-                    pairings[fd.path] = fd.sidecar_path
+                    pairings[(archive, fd.path)] = fd.sidecar_path
         except Exception:
             logger.exception(f"Could not read Scout pairings for {result.path}")
             continue

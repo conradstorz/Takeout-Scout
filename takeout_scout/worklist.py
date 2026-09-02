@@ -72,33 +72,34 @@ def build_worklist(index) -> list[Finding]:
 
 
 def compare_with_scout(
-    index, scout_pairings: dict[str, str | None]
+    index, scout_pairings: dict[tuple[str | None, str], str | None]
 ) -> tuple[int, int, list[Finding]]:
     """(agreements, disagreements, findings) between the two pairings.
 
-    Scout pairs within a single archive. Inventory pairs across all of them,
-    and in one measured export 71.7% of photos had their sidecar in a
-    different archive - so on a multi-part export this count is significant.
-    It counts where the two answers differ, not where Scout was wrong:
-    Inventory is not certain about every pairing either, and some
-    disagreements are with a pairing Inventory itself marked ambiguous or
-    related.
+    Keyed by (archive, media path), because a member path alone is not unique
+    across an export: the same path can occur in more than one archive, and
+    Inventory's own index is keyed on the pair for that reason. Keying on the
+    path alone let one archive's answer overwrite another's and skewed the
+    counts this function exists to produce.
 
-    Only media present on both sides is compared. Anything Scout never looked
-    at is not a disagreement.
+    Scout pairs within a single archive. Inventory pairs across all of them,
+    so it sees sidecars Scout cannot. Only media present on both sides is
+    compared; anything Scout never looked at is not a disagreement.
     """
     agreements = 0
     findings: list[Finding] = []
 
     for pairing in index.pairings():
-        if pairing.media_path not in scout_pairings:
+        key = (pairing.archive, pairing.media_path)
+        if key not in scout_pairings:
             continue
-        scout_said = scout_pairings[pairing.media_path]
+        scout_said = scout_pairings[key]
         if scout_said == pairing.sidecar_path:
             agreements += 1
             continue
         findings.append(Finding(
             DISAGREEMENT, pairing.media_path,
+            f"in {pairing.archive or 'a loose file'}: "
             f"Scout paired {scout_said or 'nothing'}; "
             f"Inventory paired {pairing.sidecar_path or 'nothing'} "
             f"by rule '{pairing.rule}'"))
