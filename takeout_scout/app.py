@@ -50,6 +50,7 @@ from takeout_scout import (
     compare_with_scout,
     export_dir_for,
     is_comparable,
+    INDEX_SQLITE_NAME,
 )
 from takeout_scout.utils import partition_known_paths, remove_dirs, unreferenced_dirs
 from takeout_scout.constants import ensure_directories
@@ -864,6 +865,11 @@ def scan_single_file(index: int):
                 summary = scan_archive(file_info.path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
 
         st.session_state.results.append(summary)
+        # A work list describes the results that existed when it was built.
+        # Adding an archive invalidates it - showing stale numbers against a
+        # larger result set is worse than showing none.
+        st.session_state.worklist = None
+        st.session_state.deep_pass_summary = None
         st.session_state.scanned_paths.add(str(file_info.path))
 
         # Update hash index if hashes were computed
@@ -933,6 +939,11 @@ def scan_all_pending():
                 summary = scan_archive(file_info.path, compute_hashes=compute_hashes, parse_sidecars=parse_sidecars)
 
             st.session_state.results.append(summary)
+            # A work list describes the results that existed when it was built.
+            # Adding an archive invalidates it - showing stale numbers against a
+            # larger result set is worse than showing none.
+            st.session_state.worklist = None
+            st.session_state.deep_pass_summary = None
             st.session_state.scanned_paths.add(str(file_info.path))
 
             if compute_hashes:
@@ -1852,7 +1863,10 @@ def show_deep_pass_offer():
     st.caption(
         "Reads every archive and resolves pairings across all of them. "
         "The first run takes a while; results are cached per archive, so "
-        "later runs are fast. Nothing in your archives is modified."
+        "later runs are fast. Nothing in your archives is modified — "
+        "Inventory writes its index and cache alongside them: "
+        f"{INDEX_SQLITE_NAME}, takeout-index.json, inventory.json and a "
+        "cache directory."
     )
 
     if st.button("🔬 Run deep pass", type="primary", width="stretch"):
@@ -1884,7 +1898,7 @@ def run_deep_pass(tool: InventoryTool, takeout_dir: Path):
             st.code("\n".join(failure.tail))
             return
 
-    index_path = takeout_dir / 'takeout-index.sqlite'
+    index_path = takeout_dir / INDEX_SQLITE_NAME
     try:
         index = TakeoutIndex.open(index_path)
     except IndexUnusable as e:
@@ -1941,7 +1955,7 @@ def show_worklist():
         col1, col2, col3 = st.columns(3)
         col1.metric("Compared", f"{summary['compared']:,}")
         col2.metric("Agreed", f"{summary['agreements']:,}")
-        col3.metric("Scout was wrong", f"{summary['disagreements']:,}")
+        col3.metric("Differed", f"{summary['disagreements']:,}")
         if summary.get('scout_paired', 0) > summary['compared']:
             st.caption(
                 f"Scout paired {summary['scout_paired']:,} files; "
@@ -1954,6 +1968,14 @@ def show_worklist():
             "Inventory usually has more evidence — but check the work list "
             "below: pairings it marks ambiguous or related are ones it was "
             "not certain about either."
+        )
+    elif summary and summary.get('scout_paired'):
+        st.caption(
+            f"Scout paired {summary['scout_paired']:,} files, but none of them "
+            f"could be matched to a row in the index, so no comparison is "
+            f"shown. This is expected for directory scans: Scout keys files by "
+            f"their path within the scanned folder, while the index keys them "
+            f"by their path inside the archive."
         )
 
     findings = st.session_state.worklist or []
@@ -1977,7 +1999,11 @@ def show_worklist():
         file_name=f"worklist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime='text/csv',
     )
-    st.caption("Nothing in your archives has been modified.")
+    st.caption(
+        "Nothing in your archives has been modified. Inventory wrote its "
+        f"index and cache alongside them: {INDEX_SQLITE_NAME}, "
+        "takeout-index.json, inventory.json and a cache directory."
+    )
 
 
 def process_uploaded_files(uploaded_files):

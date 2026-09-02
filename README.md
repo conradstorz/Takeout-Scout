@@ -36,7 +36,10 @@ Inventory is run as a separate program, never imported — Scout is GPL-3.0 and
 Inventory is AGPL-3.0. Scout works fully without it; the offer simply does not
 appear.
 
-**Nothing in your archives is modified.** The output is a list.
+**Nothing in your archives is modified.** Inventory writes its index and
+cache alongside them, in the export directory: `takeout-index.sqlite`,
+`takeout-index.json`, `inventory.json` and a cache directory. The output
+Scout shows you is a list.
 
 ## Requirements
 

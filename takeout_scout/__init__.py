@@ -63,6 +63,7 @@ from takeout_scout.inventory_runner import (
     deep_pass_commands,
     run_streaming,
     export_dir_for,
+    INDEX_SQLITE_NAME,
 )
 from takeout_scout.index_reader import (
     IndexUnusable,
@@ -130,6 +131,7 @@ __all__ = [
     "deep_pass_commands",
     "run_streaming",
     "export_dir_for",
+    "INDEX_SQLITE_NAME",
     "IndexUnusable",
     "IndexedPairing",
     "TakeoutIndex",

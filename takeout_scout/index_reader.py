@@ -4,8 +4,8 @@ Read-only, always. This file belongs to another program; Scout must be
 incapable of writing to it.
 
 The index answers the one question Scout's own scan gets wrong. Scout pairs a
-photo to its sidecar within a single archive; on the real export measured by
-Inventory, 71.7% of photos have their sidecar in a *different* archive.
+photo to its sidecar within a single archive; in one measured export, 71.7%
+of photos had their sidecar in a *different* archive.
 """
 from __future__ import annotations
 

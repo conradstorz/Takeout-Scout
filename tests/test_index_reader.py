@@ -95,8 +95,26 @@ class TestOpen:
         with pytest.raises(IndexUnusable, match="schema"):
             TakeoutIndex.open(path)
 
-    def test_missing_index_meta_is_refused(self, tmp_path):
+    def test_empty_index_meta_is_refused(self, tmp_path):
         path = build_index(tmp_path / "i.sqlite", with_meta=False)
+        with pytest.raises(IndexUnusable):
+            TakeoutIndex.open(path)
+
+    def test_missing_index_meta_table_is_refused(self, tmp_path):
+        """The genuine 'no index_meta table at all' branch.
+
+        build_index(with_meta=False) still creates the table via SCHEMA and
+        only skips inserting rows, so it cannot exercise this branch - that's
+        what test_empty_index_meta_is_refused covers instead. This builds a
+        database with no index_meta table whatsoever, straight with sqlite3.
+        """
+        path = tmp_path / "i.sqlite"
+        con = sqlite3.connect(path)
+        con.executescript(
+            "CREATE TABLE media (id INTEGER PRIMARY KEY, path TEXT);"
+            "CREATE TABLE sidecar (id INTEGER PRIMARY KEY, path TEXT);")
+        con.commit()
+        con.close()
         with pytest.raises(IndexUnusable):
             TakeoutIndex.open(path)
 

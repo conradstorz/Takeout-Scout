@@ -77,9 +77,12 @@ def compare_with_scout(
     """(agreements, disagreements, findings) between the two pairings.
 
     Scout pairs within a single archive. Inventory pairs across all of them,
-    and on the real export 71.7% of photos have their sidecar in a different
-    archive - so on a multi-part export this disagreement count is the honest
-    measure of what the quick scan got wrong.
+    and in one measured export 71.7% of photos had their sidecar in a
+    different archive - so on a multi-part export this count is significant.
+    It counts where the two answers differ, not where Scout was wrong:
+    Inventory is not certain about every pairing either, and some
+    disagreements are with a pairing Inventory itself marked ambiguous or
+    related.
 
     Only media present on both sides is compared. Anything Scout never looked
     at is not a disagreement.

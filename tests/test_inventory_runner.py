@@ -81,6 +81,39 @@ class TestFindInventory:
 
         assert find_inventory().script.is_absolute()
 
+    def test_malformed_remembered_path_falls_through(self, tmp_path, monkeypatch):
+        """A saved path can be anything a user typed.
+
+        expanduser() raises RuntimeError on POSIX for an unknown ~user, and
+        find_inventory is called on every Streamlit rerun with a remembered
+        string pulled straight from state/inventory_path.json - a malformed
+        value must fall through to the sibling lookup rather than crash the
+        page.
+
+        Simulated with monkeypatch rather than a literal null-byte string
+        (e.g. "bad\\x00path.py"): on Python 3.13's pathlib, Path.is_file()
+        already has its own `except ValueError: return False`, so the
+        ValueError a null byte raises never reaches find_inventory's own
+        try/except at all here - a null-byte test would pass identically
+        whether or not this fix exists, proving nothing. Monkeypatching
+        expanduser() to raise directly exercises the guard this fix adds,
+        and fails without it regardless of platform or pathlib version.
+        """
+        script = _make_inventory(tmp_path)
+        scout_root = tmp_path / "Takeout-Scout"
+        scout_root.mkdir()
+        monkeypatch.setattr("takeout_scout.inventory_runner.SCOUT_ROOT", scout_root)
+
+        def _raise_runtime_error(self):
+            raise RuntimeError("Can't determine home directory")
+        monkeypatch.setattr(Path, "expanduser", _raise_runtime_error)
+
+        found = find_inventory(remembered="~nouser/x.py")
+
+        assert found is not None
+        assert found.script == script
+        assert found.source == "sibling"
+
 
 import sys
 import time

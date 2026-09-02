@@ -1,8 +1,8 @@
 """Run Takeout_Inventory as a separate program.
 
 Inventory performs the deep, cross-archive pass that Scout's per-archive scan
-cannot: on a real export, 71.7% of photos have their sidecar in a different
-archive than the media file.
+cannot: in one measured export, 71.7% of photos had their sidecar in a
+different archive than the media file.
 
 It is invoked as a subprocess and never imported. That is a licence boundary,
 not a style preference - Scout is GPL-3.0-or-later, Inventory is
@@ -49,9 +49,15 @@ def find_inventory(remembered: str | None = None) -> InventoryTool | None:
     appear.
     """
     if remembered:
-        candidate = Path(remembered).expanduser()
-        if candidate.is_file():
-            return InventoryTool(candidate.resolve(), "remembered")
+        try:
+            candidate = Path(remembered).expanduser()
+            if candidate.is_file():
+                return InventoryTool(candidate.resolve(), "remembered")
+        except (OSError, RuntimeError, ValueError):
+            # A saved path can be anything a user typed. expanduser() raises
+            # RuntimeError on POSIX for an unknown ~user, and this function is
+            # called on every rerun - a bad saved value must not crash the page.
+            pass
 
     sibling = SCOUT_ROOT.parent / SIBLING_DIR / SCRIPT_NAME
     if sibling.is_file():
