@@ -39,9 +39,16 @@ def build_index(path: Path, *, schema_version: str = "1",
     con = sqlite3.connect(path)
     con.executescript(SCHEMA)
     for row in sidecars:
+        # (id, archive, path, name, parse_error) with role defaulted, or a
+        # 6-tuple ending in an explicit role.
+        if len(row) == 6:
+            ident, archive, path_, name, parse_error, role = row
+        else:
+            (ident, archive, path_, name, parse_error), role = row, "sidecar"
         con.execute(
-            "INSERT INTO sidecar (id, archive, path, name, parse_error) "
-            "VALUES (?,?,?,?,?)", row)
+            "INSERT INTO sidecar (id, archive, path, name, parse_error, role) "
+            "VALUES (?,?,?,?,?,?)",
+            (ident, archive, path_, name, parse_error, role))
     for row in media:
         con.execute(
             "INSERT INTO media (id, archive, path, area, folder, name, "
@@ -146,3 +153,26 @@ class TestQueries:
         assert index.claimed_sidecar_paths() == {"Photos/a.jpg.json"}
         assert index.all_sidecar_paths() == {
             "Photos/a.jpg.json", "Photos/bad.json"}
+
+    def test_album_metadata_is_not_a_sidecar_candidate(self, tmp_path):
+        """Inventory's sidecar table holds every .json member.
+
+        Album metadata and account-level lists are not per-photo sidecars and
+        were never candidates for pairing. Counting them as orphans would
+        invent defects in a list whose whole value is that its entries are
+        real.
+        """
+        path = build_index(
+            tmp_path / "i.sqlite",
+            sidecars=[
+                (1, "p1.zip", "Photos/a.jpg.json", "a.jpg.json", None, "sidecar"),
+                (2, "p1.zip", "Album/metadata.json", "metadata.json", None,
+                 "album-metadata"),
+            ],
+            media=[(1, "p1.zip", "Photos/a.jpg", "Photos", "Photos", "a.jpg",
+                    1, "exact", "own")],
+        )
+        index = TakeoutIndex.open(path)
+
+        assert index.all_sidecar_paths() == {"Photos/a.jpg.json"}
+        assert index.all_sidecar_paths() - index.claimed_sidecar_paths() == set()

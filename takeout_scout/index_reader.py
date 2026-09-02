@@ -57,7 +57,7 @@ class TakeoutIndex:
         self._con = con
 
     @classmethod
-    def open(cls, path: Path) -> "TakeoutIndex":
+    def open(cls, path: Path) -> TakeoutIndex:
         path = Path(path)
         if not path.is_file():
             raise IndexUnusable(f"no index at {path}")
@@ -156,5 +156,13 @@ class TakeoutIndex:
             "JOIN media m ON m.sidecar_id = s.id")}
 
     def all_sidecar_paths(self) -> set[str]:
+        """Per-asset sidecar paths - the only ones that could be orphans.
+
+        The sidecar table holds every .json member Inventory found, including
+        album metadata and account-level lists. Those are not per-photo
+        sidecars and were never candidates for pairing, so counting them as
+        orphans would invent defects. Inventory sets `role` precisely so a
+        consumer can tell them apart.
+        """
         return {r["path"] for r in self._con.execute(
-            "SELECT path FROM sidecar")}
+            "SELECT path FROM sidecar WHERE role = 'sidecar'")}
