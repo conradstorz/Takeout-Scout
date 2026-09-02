@@ -167,3 +167,19 @@ class TakeoutIndex:
         """
         return {r["path"] for r in self._con.execute(
             "SELECT path FROM sidecar WHERE role = 'sidecar'")}
+
+    def close(self) -> None:
+        """Release the file handle.
+
+        Not merely tidy: Inventory publishes its index by writing a temp file
+        and renaming it over the target, and on Windows an open handle makes
+        that rename fail with PermissionError. Leaving this connection open
+        would break the *next* deep pass, not this one.
+        """
+        self._con.close()
+
+    def __enter__(self) -> TakeoutIndex:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()

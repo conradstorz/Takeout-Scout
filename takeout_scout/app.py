@@ -1910,23 +1910,30 @@ def run_deep_pass(tool: InventoryTool, takeout_dir: Path):
 
     index_path = takeout_dir / INDEX_SQLITE_NAME
     try:
-        index = TakeoutIndex.open(index_path)
+        index_cm = TakeoutIndex.open(index_path)
     except IndexUnusable as e:
         st.error(f"The deep pass finished but its index could not be read: {e}")
         return
 
-    scout_pairings = _scout_pairings(takeout_dir)
-    agree, disagree, disagreements = compare_with_scout(index, scout_pairings)
+    # Closed as soon as everything needed is pulled out into plain lists and
+    # dicts below - Inventory republishes this same file by renaming a temp
+    # file over it, and on Windows a lingering open handle would make that
+    # rename fail on the *next* deep pass.
+    with index_cm as index:
+        scout_pairings = _scout_pairings(takeout_dir)
+        agree, disagree, disagreements = compare_with_scout(index, scout_pairings)
+        worklist = build_worklist(index) + disagreements
+        deep_pass_summary = {
+            'rules': index.counts_by_rule(),
+            'confidence': index.counts_by_confidence(),
+            'agreements': agree,
+            'disagreements': disagree,
+            'compared': agree + disagree,
+            'scout_paired': len(scout_pairings),
+        }
 
-    st.session_state.worklist = build_worklist(index) + disagreements
-    st.session_state.deep_pass_summary = {
-        'rules': index.counts_by_rule(),
-        'confidence': index.counts_by_confidence(),
-        'agreements': agree,
-        'disagreements': disagree,
-        'compared': agree + disagree,
-        'scout_paired': len(scout_pairings),
-    }
+    st.session_state.worklist = worklist
+    st.session_state.deep_pass_summary = deep_pass_summary
     st.success("Deep pass complete.")
     st.rerun()
 

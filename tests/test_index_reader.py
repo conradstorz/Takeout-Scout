@@ -139,6 +139,31 @@ class TestOpen:
             index._con.execute("DELETE FROM media")
 
 
+class TestClose:
+    def test_the_index_file_can_be_replaced_after_use(self, tmp_path, simple_index):
+        """Inventory republishes its index by renaming a temp file over this one.
+
+        On Windows an open handle makes that rename fail, so a leaked
+        connection here breaks the *next* deep pass rather than this one.
+        """
+        import os
+
+        with TakeoutIndex.open(simple_index) as index:
+            assert index.pairings()
+
+        replacement = tmp_path / "replacement.sqlite"
+        sqlite3.connect(replacement).close()
+        os.replace(replacement, simple_index)   # must not raise
+
+        assert simple_index.exists()
+
+    def test_close_is_idempotent(self, simple_index):
+        """A double close must not raise - the caller may not know."""
+        index = TakeoutIndex.open(simple_index)
+        index.close()
+        index.close()
+
+
 class TestQueries:
     def test_pairing_fields(self, simple_index):
         index = TakeoutIndex.open(simple_index)

@@ -32,9 +32,9 @@ every archive at once and publishes an index, which Scout reads back as a work
 list: orphaned media, orphaned sidecars, pairings whose location data cannot be
 trusted, and every place Scout's own answer was wrong.
 
-Inventory is run as a separate program, never imported — Scout is GPL-3.0 and
-Inventory is AGPL-3.0. Scout works fully without it; the offer simply does not
-appear.
+Inventory is run as a separate program, never imported — Scout is
+GPL-3.0-or-later and Inventory is AGPL-3.0-or-later. Scout works fully
+without it; the offer simply does not appear.
 
 **Nothing in your archives is modified.** Inventory writes its index and
 cache alongside them, in the export directory: `takeout-index.sqlite`,
