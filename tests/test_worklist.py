@@ -4,7 +4,6 @@ Pure functions over index rows. The point of the work list is that it says
 what is *wrong*, so every test here is about a defect being surfaced, not
 about an inventory being complete.
 """
-import pytest
 
 from takeout_scout.index_reader import IndexedPairing
 from takeout_scout.worklist import (
