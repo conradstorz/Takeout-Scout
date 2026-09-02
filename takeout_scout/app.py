@@ -20,6 +20,7 @@ import os
 import re
 import tarfile
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -38,6 +39,15 @@ from takeout_scout import (
     human_size,
     HashIndex,
     summarize_sources,
+    InventoryTool,
+    InventoryFailed,
+    find_inventory,
+    deep_pass_commands,
+    run_streaming,
+    IndexUnusable,
+    TakeoutIndex,
+    build_worklist,
+    compare_with_scout,
 )
 from takeout_scout.utils import partition_known_paths, remove_dirs, unreferenced_dirs
 from takeout_scout.constants import ensure_directories
@@ -136,6 +146,27 @@ STATE_DIR = Path('state')
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 RECENT_FOLDERS_PATH = STATE_DIR / 'recent_folders.json'
 MAX_RECENT_FOLDERS = 10
+INVENTORY_PATH_FILE = STATE_DIR / 'inventory_path.json'
+
+
+def load_inventory_path() -> Optional[str]:
+    """The takeout_inventory.py path chosen in an earlier session, if any."""
+    if INVENTORY_PATH_FILE.exists():
+        try:
+            with open(INVENTORY_PATH_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f).get('path')
+        except Exception as e:
+            logger.warning(f"Could not read remembered Inventory path: {e}")
+    return None
+
+
+def save_inventory_path(path: str) -> None:
+    """Remember a takeout_inventory.py path for next time."""
+    try:
+        with open(INVENTORY_PATH_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'path': path}, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not save Inventory path: {e}")
 
 
 # --- Recent folders helpers --------------------------------------------------
@@ -318,6 +349,12 @@ def main():
         st.session_state.deep_scan_results = {}  # path -> DeepScanResult
     if 'upload_dirs' not in st.session_state:
         st.session_state.upload_dirs = []  # Temp dirs from previous uploads, pending cleanup
+    if 'inventory_path' not in st.session_state:
+        st.session_state.inventory_path = load_inventory_path()
+    if 'worklist' not in st.session_state:
+        st.session_state.worklist = None  # list[Finding] once a deep pass has run
+    if 'deep_pass_summary' not in st.session_state:
+        st.session_state.deep_pass_summary = None
 
     # Sidebar for controls
     with st.sidebar:
@@ -481,6 +518,8 @@ def main():
                 st.session_state.hash_index = HashIndex()
                 st.session_state.parse_sidecars = True
                 st.session_state.deep_scan_results = {}
+                st.session_state.worklist = None
+                st.session_state.deep_pass_summary = None
                 remove_dirs(st.session_state.upload_dirs)
                 st.session_state.upload_dirs = []
                 st.rerun()
@@ -496,6 +535,9 @@ def main():
         display_results_table()
     elif not st.session_state.pending_files:
         show_welcome_screen()
+
+    show_deep_pass_offer()
+    show_worklist()
 
     # Show date analysis if sidecars were parsed
     if st.session_state.parse_sidecars and st.session_state.results:
@@ -1756,6 +1798,184 @@ def show_full_inventory():
         st.dataframe(df.head(100), hide_index=True, width="stretch")
         if len(df) > 100:
             st.info(f"Showing first 100 of {len(df):,} files")
+
+
+def show_deep_pass_offer():
+    """Offer the Inventory deep pass, if Inventory can be found.
+
+    Scout pairs photos to sidecars within one archive. Inventory pairs across
+    all of them, which on a real multi-part export is a different answer for
+    most photos. This is where that gap gets closed.
+    """
+    if not st.session_state.results:
+        return
+
+    tool = find_inventory(st.session_state.inventory_path)
+
+    st.divider()
+    st.header("🔬 Deep pass")
+
+    if tool is None:
+        st.info(
+            "Takeout Inventory was not found, so the deep cross-archive pass "
+            "is unavailable. Scout works fine without it — this would add "
+            "correct media↔sidecar pairing across archive boundaries."
+        )
+        with st.expander("Point Scout at takeout_inventory.py"):
+            entered = st.text_input(
+                "Path to takeout_inventory.py",
+                key="inventory_path_input",
+                help="Part of the separate Takeout_Inventory project.",
+            )
+            if entered and st.button("Save path"):
+                cleaned = clean_file_path(entered)
+                st.session_state.inventory_path = cleaned
+                save_inventory_path(cleaned)
+                st.rerun()
+        return
+
+    directories = sorted({_export_dir_for(r.path) for r in st.session_state.results})
+
+    st.caption(f"Using `{tool.script}` (found: {tool.source})")
+    if len(directories) == 1:
+        chosen = directories[0]
+        st.write(f"Will analyse: `{chosen}`")
+    else:
+        chosen = st.selectbox(
+            "Which export directory?",
+            directories,
+            help="Inventory analyses one directory at a time.",
+        )
+
+    st.caption(
+        "Reads every archive and resolves pairings across all of them. "
+        "The first run takes a while; results are cached per archive, so "
+        "later runs are fast. Nothing in your archives is modified."
+    )
+
+    if st.button("🔬 Run deep pass", type="primary", width="stretch"):
+        run_deep_pass(tool, Path(chosen))
+
+
+def _export_dir_for(scanned_path: str) -> str:
+    """The directory Inventory should be pointed at for a scanned result.
+
+    ArchiveSummary.path is whatever was scanned. For an archive
+    (D:/exports/takeout-001.zip) the export directory is its parent. For a
+    directory scan (D:/exports/Takeout) the path *is* the export directory —
+    taking .parent there would send Inventory one level too high, where it
+    would find the wrong thing or nothing.
+    """
+    path = Path(scanned_path)
+    return str(path if path.is_dir() else path.parent)
+
+
+def run_deep_pass(tool: InventoryTool, takeout_dir: Path):
+    """Run Inventory's two phases, streaming output into the page."""
+    output = st.empty()
+    lines: List[str] = []
+
+    for phase, cmd in deep_pass_commands(tool, takeout_dir):
+        st.write(f"**{phase}**")
+        try:
+            for line in run_streaming(cmd, takeout_dir, phase=phase):
+                lines.append(line)
+                output.code("\n".join(lines[-40:]))
+        except FileNotFoundError:
+            st.error(
+                "Could not run `uv`. Takeout Inventory is a PEP 723 script "
+                "and needs uv on PATH to resolve its dependencies."
+            )
+            return
+        except InventoryFailed as failure:
+            st.error(f"The {failure.phase} phase exited with code {failure.returncode}.")
+            st.code("\n".join(failure.tail))
+            return
+
+    index_path = takeout_dir / 'takeout-index.sqlite'
+    try:
+        index = TakeoutIndex.open(index_path)
+    except IndexUnusable as e:
+        st.error(f"The deep pass finished but its index could not be read: {e}")
+        return
+
+    scout_pairings = _scout_pairings()
+    agree, disagree, disagreements = compare_with_scout(index, scout_pairings)
+
+    st.session_state.worklist = build_worklist(index) + disagreements
+    st.session_state.deep_pass_summary = {
+        'rules': index.counts_by_rule(),
+        'confidence': index.counts_by_confidence(),
+        'agreements': agree,
+        'disagreements': disagree,
+        'compared': len(scout_pairings),
+    }
+    st.success("Deep pass complete.")
+    st.rerun()
+
+
+def _scout_pairings() -> dict:
+    """Scout's own media→sidecar answers, for comparison with Inventory's.
+
+    Read from the discovery records the quick scan already wrote, so this
+    compares what Scout actually concluded rather than recomputing it.
+    """
+    pairings = {}
+    for result in st.session_state.results:
+        try:
+            discovery = load_takeout_discovery(Path(result.path))
+            if not discovery:
+                continue
+            for fd in discovery.iter_file_details():
+                if fd.file_type in ('photo', 'video'):
+                    pairings[fd.path] = fd.sidecar_path
+        except Exception:
+            logger.exception(f"Could not read Scout pairings for {result.path}")
+            continue
+    return pairings
+
+
+def show_worklist():
+    """What the deep pass found that needs attention."""
+    if not st.session_state.worklist and not st.session_state.deep_pass_summary:
+        return
+
+    summary = st.session_state.deep_pass_summary
+    st.divider()
+    st.header("🧾 Work list")
+
+    if summary and summary['compared']:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Compared", f"{summary['compared']:,}")
+        col2.metric("Agreed", f"{summary['agreements']:,}")
+        col3.metric("Scout was wrong", f"{summary['disagreements']:,}")
+        st.caption(
+            "Scout pairs within one archive; Inventory pairs across all of "
+            "them. Where they differ, Inventory is right."
+        )
+
+    findings = st.session_state.worklist or []
+    if not findings:
+        st.success("Nothing needs attention.")
+        return
+
+    counts = Counter(f.kind for f in findings)
+    st.write(" · ".join(f"{n:,} {kind.replace('_', ' ')}"
+                        for kind, n in sorted(counts.items())))
+
+    df = pd.DataFrame([
+        {'kind': f.kind, 'path': f.path, 'detail': f.detail}
+        for f in findings
+    ])
+    st.dataframe(df, hide_index=True, width="stretch")
+
+    st.download_button(
+        label="📥 Export work list (CSV)",
+        data=df.to_csv(index=False).encode('utf-8'),
+        file_name=f"worklist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime='text/csv',
+    )
+    st.caption("Nothing in your archives has been modified.")
 
 
 def process_uploaded_files(uploaded_files):

@@ -14,6 +14,8 @@ import importlib
 from pathlib import Path
 
 from takeout_scout.hashing import HashIndex
+from takeout_scout.index_reader import TakeoutIndex
+from takeout_scout.inventory_runner import InventoryTool
 from takeout_scout.models import FileDetails, TakeoutDiscovery
 
 
@@ -37,6 +39,8 @@ KNOWN_OBJECTS = {
     "discovery": TakeoutDiscovery,
     "fd": FileDetails,
     "hash_index": HashIndex,
+    "index": TakeoutIndex,
+    "tool": InventoryTool,
 }
 
 
@@ -44,9 +48,14 @@ def _valid_attrs_for(cls) -> set:
     """The set of legitimate attribute names for one of KNOWN_OBJECTS's classes."""
     if dataclasses.is_dataclass(cls):
         return {f.name for f in dataclasses.fields(cls)} | set(dir(cls))
-    # HashIndex: _by_hash and _by_path are created in __init__, so they do
-    # not appear on the class itself — it must be instantiated to see them.
-    return set(dir(cls()))
+    try:
+        # HashIndex: _by_hash and _by_path are created in __init__, so they do
+        # not appear on the class itself — it must be instantiated to see them.
+        return set(dir(cls()))
+    except TypeError:
+        # TakeoutIndex needs a connection; its public surface is all methods,
+        # which are visible on the class.
+        return set(dir(cls))
 
 
 def _collect_known_object_attr_accesses(source: str):

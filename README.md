@@ -20,6 +20,24 @@ A modern, web-based tool for scanning and analyzing Google Takeout archives with
 - **CSV export** - Export summaries for further analysis
 - **Rotating logs** - Comprehensive logging with automatic rotation
 
+## Deep pass with Takeout Inventory
+
+Scout pairs each photo with its `.json` sidecar within a single archive. On a
+multi-part export that is usually the wrong answer — in one measured export,
+71.7% of photos had their sidecar in a *different* archive.
+
+If [`Takeout_Inventory`](https://github.com/conradstorz/Takeout_Inventory) is
+available, Scout offers to run it after a scan. It resolves pairings across
+every archive at once and publishes an index, which Scout reads back as a work
+list: orphaned media, orphaned sidecars, pairings whose location data cannot be
+trusted, and every place Scout's own answer was wrong.
+
+Inventory is run as a separate program, never imported — Scout is GPL-3.0 and
+Inventory is AGPL-3.0. Scout works fully without it; the offer simply does not
+appear.
+
+**Nothing in your archives is modified.** The output is a list.
+
 ## Requirements
 
 - Python 3.10+
